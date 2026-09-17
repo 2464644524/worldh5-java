@@ -1,0 +1,32 @@
+# Build output
+/target/
+
+# Runtime/private data (accounts, Excel, Edge profiles, mission logs)
+/data/
+
+# Local reverse-engineering/debug scratch
+/dev/
+
+# Bundled local tools (download separately; keep repository small)
+/tools/
+/.tools/
+
+# IDE / OS files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
+
+# Logs/temp/crash files
+*.log
+*.tmp
+*.temp
+hs_err_pid*
+replay_pid*
+
+# Playwright/browser cache
+.playwright/
+ms-playwright/

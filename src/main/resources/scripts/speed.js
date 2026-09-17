@@ -1,0 +1,1 @@
+Control.DEFAULT_MOVE_SPEED = 12

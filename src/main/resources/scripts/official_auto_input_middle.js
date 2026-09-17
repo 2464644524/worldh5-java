@@ -1,0 +1,1 @@
+';PanelManager.getPanel(LoginPanel).input_password.text='

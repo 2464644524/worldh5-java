@@ -1,0 +1,1394 @@
+package com.liang.world.desktop;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.microsoft.playwright.CDPSession;
+import com.microsoft.playwright.BrowserContext;
+import com.microsoft.playwright.BrowserType;
+import com.microsoft.playwright.Frame;
+import com.microsoft.playwright.Page;
+import com.microsoft.playwright.options.ViewportSize;
+import com.microsoft.playwright.Playwright;
+import com.microsoft.playwright.options.LoadState;
+
+import java.awt.Rectangle;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import java.util.Optional;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class AccountSession implements AutoCloseable {
+    public static final String GAME_URL_MARKER =
+            "worldh5.gamehz.cn/version/world/publish/channel/res/index.html";
+
+    private static final Gson GSON = new Gson();
+    private static final int MOBILE_WIDTH = 510;
+    private static final int MOBILE_HEIGHT = 760;
+    private static final Pattern CHROME_VERSION = Pattern.compile("Chrome/(\\d+)");
+
+    private final AccountConfig config;
+    private final Path profileDir;
+    private final Consumer<String> logger;
+    private Rectangle gameBounds;
+
+    private BrowserContext context;
+    private Page page;
+    private CDPSession cdpSession;
+    private Long browserWindowId;
+    private int windowX;
+    private int windowY;
+    private int windowOuterWidth;
+    private int windowOuterHeight;
+    private boolean bootstrapped;
+    private String officialUsername = "";
+    private String officialPassword = "";
+    private boolean officialLoginSubmitted;
+    private boolean roleEnterSubmitted;
+    private boolean createRoleNotified;
+    private boolean captchaNotified;
+    private boolean loginTipNotified;
+    // 仅“导号换号”这一次打开需要清 Cookie/本地存储；平时打开沿用已登录会话。
+    private boolean forceFreshLogin;
+
+    private Page activePage;
+    private String mobileUserAgent;
+    private int mobileWidth = MOBILE_WIDTH;
+    private int mobileHeight = MOBILE_HEIGHT;
+    private int chromeWidth = 16;
+    private int chromeHeight = 88;
+    private volatile double gameScale = 1.0;
+    private String chromeVersion;
+    private boolean popupNotified;
+    private final java.util.Set<Page> adoptedPages =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // 主控号采集到的归一化触摸事件，交给 SessionManager 广播（可能由 Playwright 网络回调线程触发）。
+    private volatile java.util.function.Consumer<String> syncEventListener;
+
+    // 自动/刷怪/跟随在游戏内的真实运行状态（读 TestXxx._isStarting），每秒轮询刷新。
+    public static final int FLAG_AUTO = 1;
+    public static final int FLAG_REFRESH = 2;
+    public static final int FLAG_LOOP = 4;
+    private volatile int scriptFlags;
+
+    public AccountSession(AccountConfig config, Path profileDir, Rectangle gameBounds,
+                          Consumer<String> logger) {
+        this.config = config;
+        this.profileDir = profileDir;
+        this.gameBounds = gameBounds;
+        this.logger = logger;
+    }
+
+    public boolean isOpen() {
+        return context != null && page != null && !page.isClosed();
+    }
+
+    public synchronized boolean isBootstrapped() {
+        return bootstrapped;
+    }
+
+    // 调整游戏区/辅助栏比例后，实时把已打开的窗口重新居中到新游戏区。
+    public synchronized void updateGameBounds(Rectangle bounds) {
+        this.gameBounds = bounds;
+        if (isOpen() && windowOuterWidth > 0 && windowOuterHeight > 0) {
+            windowX = gameBounds.x + Math.max(0, (gameBounds.width - windowOuterWidth) / 2);
+            windowY = gameBounds.y + Math.max(0, (gameBounds.height - windowOuterHeight) / 2);
+            try {
+                forceWindowBounds();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public String currentUrl() {
+        if (!isOpen()) {
+            return "";
+        }
+        try {
+            return page.url();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    // 实时调整 Edge 手机仿真分辨率：改 viewport、外框窗口尺寸并重新居中。
+    public synchronized void updateEmulationSize(int width, int height) {
+        mobileWidth = Math.max(240, Math.min(1400, width));
+        mobileHeight = Math.max(320, Math.min(2000, height));
+        if (!isOpen()) {
+            return;
+        }
+        windowOuterWidth = mobileWidth + chromeWidth;
+        windowOuterHeight = mobileHeight + chromeHeight;
+        if (gameBounds != null) {
+            windowX = gameBounds.x + Math.max(0, (gameBounds.width - windowOuterWidth) / 2);
+            windowY = gameBounds.y + Math.max(0, (gameBounds.height - windowOuterHeight) / 2);
+        }
+        for (Page candidate : activePages()) {
+            try {
+                if (!candidate.isClosed()) {
+                    // 视口跟随窗口，只需改外框窗口大小，内容区会自动变成 mobileWidth x mobileHeight。
+                    resizePageWindow(candidate);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public double getGameScale() {
+        return gameScale;
+    }
+
+    // 实时缩放游戏画面（绕开 Edge 窗口最小宽度限制）。k 为相对视口的比例，如 0.7。
+    public synchronized void setGameScale(double k) {
+        double value = Math.max(0.35, Math.min(1.2, k));
+        this.gameScale = value;
+        if (!isOpen()) {
+            return;
+        }
+        String js = "(k) => { window.__worldGameScale = k; "
+                + "if (typeof window.__worldGameSetScale === 'function') window.__worldGameSetScale(k); }";
+        for (Page candidate : activePages()) {
+            try {
+                if (candidate.isClosed()) {
+                    continue;
+                }
+                for (Frame frame : candidate.frames()) {
+                    try {
+                        frame.evaluate(js, value);
+                    } catch (Exception ignored) {
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void resizePageWindow(Page target) {
+        if (target == null || target.isClosed() || browserWindowId == null) {
+            return;
+        }
+        try {
+            CDPSession perCdp = context.newCDPSession(target);
+            JsonObject info = perCdp.send("Browser.getWindowForTarget");
+            long windowId = info.get("windowId").getAsLong();
+            JsonObject bounds = new JsonObject();
+            bounds.addProperty("left", windowX);
+            bounds.addProperty("top", windowY);
+            bounds.addProperty("width", windowOuterWidth);
+            bounds.addProperty("height", windowOuterHeight);
+            bounds.addProperty("windowState", "normal");
+            JsonObject params = new JsonObject();
+            params.addProperty("windowId", windowId);
+            params.add("bounds", bounds);
+            perCdp.send("Browser.setWindowBounds", params);
+        } catch (Exception ignored) {
+        }
+    }
+
+    public synchronized void prepareOfficialLogin(String username, String password) {
+        this.officialUsername = username == null ? "" : username.trim();
+        this.officialPassword = password == null ? "" : password.trim();
+        this.forceFreshLogin = true;
+        resetOfficialAutomationState();
+    }
+
+    public synchronized void clearOfficialLogin() {
+        this.officialUsername = "";
+        this.officialPassword = "";
+        this.forceFreshLogin = false;
+        resetOfficialAutomationState();
+    }
+
+    public synchronized String getOfficialUsername() {
+        return officialUsername == null ? "" : officialUsername;
+    }
+
+    public synchronized String getOfficialPassword() {
+        return officialPassword == null ? "" : officialPassword;
+    }
+
+    private void resetOfficialAutomationState() {
+        officialLoginSubmitted = false;
+        roleEnterSubmitted = false;
+        createRoleNotified = false;
+        captchaNotified = false;
+        loginTipNotified = false;
+    }
+
+
+
+    public synchronized void open(Playwright playwright) {
+        if (isOpen()) {
+            bringToFront();
+            return;
+        }
+        if (context != null) {
+            // 用户手动关掉了页面，但旧的 context 对象还残留，先清理再重开。
+            try {
+                context.close();
+            } catch (Exception ignored) {
+            }
+            context = null;
+            page = null;
+            activePage = null;
+            cdpSession = null;
+            browserWindowId = null;
+            bootstrapped = false; scriptFlags = 0;
+            popupNotified = false;
+        }
+
+        try {
+            Files.createDirectories(profileDir);
+        } catch (Exception e) {
+            throw new IllegalStateException("无法创建浏览器 Profile 目录: " + profileDir, e);
+        }
+
+        var options = new BrowserType.LaunchPersistentContextOptions()
+                .setChannel("msedge")
+                .setHeadless(false)
+                .setBypassCSP(true)
+                .setIgnoreHTTPSErrors(true)
+                // 视口不锁定：传 null 让页面视口跟随真实窗口大小，
+                // 这样手动放大/缩小 Edge 窗口时，游戏画面会按比例自适应。
+                // 不启用 Chromium 触摸设备模式（hasTouch/isMobile），桌面鼠标点击更可靠，
+                // 触摸事件由 touch_bridge.js 桥接。
+                .setViewportSize((ViewportSize) null)
+                .setIsMobile(false)
+                .setHasTouch(false)
+                .setArgs(List.of(
+                        "--window-position=" + Math.max(0, gameBounds.x) + ","
+                                + Math.max(0, gameBounds.y),
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-popup-blocking",
+                        "--disable-background-timer-throttling",
+                        "--disable-renderer-backgrounding",
+                        "--disable-backgrounding-occluded-windows",
+                        "--disable-features=Translate,msEdgeSidebar"
+                ));
+
+        context = playwright.chromium().launchPersistentContext(profileDir, options);
+        page = context.pages().isEmpty() ? context.newPage() : context.pages().get(0);
+        activePage = page;
+        popupNotified = false;
+        adoptedPages.clear();
+        adoptedPages.add(page);
+        // 游戏选角后可能 window.open 弹出真正的游戏标签页，统一接管 context 里所有页面。
+        // 同步操作：主控游戏帧把鼠标手势经该绑定回传，Java 再广播给其它号重放。
+        context.exposeFunction("__worldSyncSend", args -> {
+            try {
+                java.util.function.Consumer<String> listener = syncEventListener;
+                if (listener != null && args != null && args.length > 0 && args[0] != null) {
+                    listener.accept(String.valueOf(args[0]));
+                }
+            } catch (Exception ignored) {
+            }
+            return null;
+        });
+        // 任务进度日志：mission_log.js 通过该绑定把“提交/交接任务”文本回传控制台。
+        context.exposeFunction("__worldLog", args -> {
+            try {
+                if (args != null && args.length > 0 && args[0] != null) {
+                    String text = String.valueOf(args[0]);
+                    if (!text.isBlank()) {
+                        log("[任务] " + config.displayName() + " " + text);
+                        MissionLog.append(config.displayName(), text);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            return null;
+        });
+        context.onPage(this::onContextPage);
+        onContextPage(page);
+        hydrateOfficialCredentials();
+        if (forceFreshLogin) {
+            // 仅导号换号这一次清掉旧 Cookie，避免和上一个账号串号；平时打开保留登录态。
+            context.clearCookies();
+        }
+
+        configureMobileWindow();
+        installRedirectScripts();
+        // 换号清理只对本次打开生效（init 脚本已装配），之后普通“打开/刷新”沿用已登录会话。
+        boolean freshLogin = forceFreshLogin;
+        forceFreshLogin = false;
+        page.navigate(config.startupUrl());
+        bringToFront();
+        if (freshLogin && config.getChannel() == Channel.GUANFANG) {
+            log("已按导号账号重新登录 " + config.displayName());
+        }
+        log("已打开 " + config.displayName());
+    }
+
+    public synchronized void login() {
+        ensureOpen();
+        bootstrapped = false; scriptFlags = 0;
+        if (config.getChannel() == Channel.GUANFANG
+                && officialUsername != null && !officialUsername.isBlank()
+                && officialPassword != null && !officialPassword.isBlank()) {
+            resetOfficialAutomationState();
+        }
+        page.navigate(config.getChannel().loginUrl());
+        bringToFront();
+        log("进入登录页 " + config.displayName());
+    }
+
+    public synchronized void reload() {
+        ensureOpen();
+        bootstrapped = false; scriptFlags = 0;
+        page.reload();
+        log("刷新 " + config.displayName());
+    }
+
+    public synchronized void bringToFront() {
+        ensureOpen();
+        // 不再强制恢复窗口尺寸/位置，保留用户手动缩放/拖动 Edge 后的状态，
+        // 游戏视口跟随窗口，画面会随窗口大小自适应。
+        try {
+            Page front = activePage != null && !activePage.isClosed() ? activePage : page;
+            front.bringToFront();
+        } catch (Exception ignored) {
+        }
+        forceWindowsForeground();
+    }
+
+    public synchronized void pollBootstrap() {
+        if (!isOpen()) {
+            return;
+        }
+        adoptOtherPages();
+
+        // 稳态快车道：已注入且游戏仍在已跟踪主帧时，只用 1 次合并往返同时拿到
+        // “是否仍已注入 / 自动刷怪跟随运行位”，避免每秒全量遍历所有标签页和
+        // iframe（那会独占 worker 线程近 1 秒，卡住同步、加速、存号等所有操作）。
+        if (bootstrapped) {
+            Frame cached = activeMainGameFrame();
+            if (cached != null && pollSteadyState(cached)) {
+                return;
+            }
+        }
+
+        // 慢车道：登录页 / 加载中 / 刚跳转，才全量定位游戏帧、自动填账号、注入脚本。
+        Optional<Frame> gameFrame = locateGameFrame(false);
+        if (gameFrame.isEmpty()) {
+            return;
+        }
+        Frame frame = gameFrame.get();
+        pollOfficialAutomation(frame);
+        try {
+            Object ready = frame.evaluate(
+                    "() => typeof xself !== 'undefined' && typeof Control !== 'undefined' "
+                            + "&& typeof nato !== 'undefined' && !!xself");
+            if (!Boolean.TRUE.equals(ready)) {
+                return;
+            }
+            Object booted = frame.evaluate("() => !!window.__worldDesktopBooted");
+            if (Boolean.TRUE.equals(booted)) {
+                bootstrapped = true;
+                return;
+            }
+            injectBootstrap(frame);
+        } catch (Exception ignored) {
+            // 页面尚在加载或跨域 Frame 尚未就绪，下一轮继续。
+        }
+    }
+
+    // 单次往返读取稳态信息并刷新功能灯位；返回 false 表示页面已跳转，需走慢车道重新注入。
+    private boolean pollSteadyState(Frame frame) {
+        try {
+            Object result = frame.evaluate("""
+                    () => {
+                        try {
+                            const ready = typeof xself !== 'undefined' && !!xself
+                                && typeof Control !== 'undefined'
+                                && typeof nato !== 'undefined';
+                            if (!ready) return JSON.stringify({ ready: false });
+                            return JSON.stringify({
+                                ready: true,
+                                booted: !!window.__worldDesktopBooted,
+                                a: !!(typeof TestAutoGame !== 'undefined' && TestAutoGame._isStarting),
+                                r: !!(typeof TestRefreshGame !== 'undefined' && TestRefreshGame._isStarting),
+                                l: !!(typeof TestLoopGame !== 'undefined' && TestLoopGame._isStarting)
+                            });
+                        } catch (e) {
+                            return null;
+                        }
+                    }
+                    """);
+            if (!(result instanceof String json) || json.isBlank()) {
+                return true; // 瞬时异常：留在快车道，下一秒再试
+            }
+            JsonObject obj = JsonParser.parseString(json).getAsJsonObject();
+            if (obj.get("ready") == null || !obj.get("ready").getAsBoolean()) {
+                return true;
+            }
+            if (obj.get("booted") == null || !obj.get("booted").getAsBoolean()) {
+                return false; // 游戏发生跳转、注入标记消失，走慢车道重新注入
+            }
+            int flags = 0;
+            if (obj.get("a") != null && obj.get("a").getAsBoolean()) flags |= FLAG_AUTO;
+            if (obj.get("r") != null && obj.get("r").getAsBoolean()) flags |= FLAG_REFRESH;
+            if (obj.get("l") != null && obj.get("l").getAsBoolean()) flags |= FLAG_LOOP;
+            scriptFlags = flags;
+            return true;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+        public synchronized void startAuto() {
+        startAuto(true);
+    }
+
+    public synchronized void startAuto(boolean activateWindow) {
+        evaluateGameFrame("TestAutoGame.start()", activateWindow);
+        scriptFlags |= FLAG_AUTO;
+        log("自动已开启 " + config.displayName());
+    }
+
+    public synchronized void startRefresh() {
+        startRefresh(true);
+    }
+
+    public synchronized void startRefresh(boolean activateWindow) {
+        evaluateGameFrame("TestRefreshGame.start(4000)", activateWindow);
+        scriptFlags |= FLAG_REFRESH;
+        log("刷怪已开启 " + config.displayName());
+    }
+
+    public synchronized void startLoop() {
+        startLoop(true);
+    }
+
+    public synchronized void startLoop(boolean activateWindow) {
+        evaluateGameFrame("TestLoopGame.start()", activateWindow);
+        scriptFlags |= FLAG_LOOP;
+        log("跟随已开启 " + config.displayName());
+    }
+
+    public synchronized void stopScripts() {
+        stopScripts(true);
+    }
+
+    public synchronized void stopScripts(boolean activateWindow) {
+        evaluateGameFrame("""
+                try { TestAutoGame.stop(); } catch (e) {}
+                try { TestRefreshGame.stop(); } catch (e) {}
+                try { TestLoopGame.stop(); } catch (e) {}
+                """, activateWindow);
+        scriptFlags = 0;
+        log("脚本已停止 " + config.displayName());
+    }
+
+    public int scriptFlags() {
+        return scriptFlags;
+    }
+
+    public synchronized void stopAuto() {
+        evaluateGameFrame("try { TestAutoGame.stop(); } catch (e) {}", true);
+        scriptFlags &= ~FLAG_AUTO;
+        log("自动已关闭 " + config.displayName());
+    }
+
+    public synchronized void stopRefresh() {
+        evaluateGameFrame("try { TestRefreshGame.stop(); } catch (e) {}", true);
+        scriptFlags &= ~FLAG_REFRESH;
+        log("刷怪已关闭 " + config.displayName());
+    }
+
+    public synchronized void stopLoop() {
+        evaluateGameFrame("try { TestLoopGame.stop(); } catch (e) {}", true);
+        scriptFlags &= ~FLAG_LOOP;
+        log("跟随已关闭 " + config.displayName());
+    }
+
+    // 设置里勾选后实时生效：不用重开窗口，直接在游戏帧启动/停止定时清背包。
+    public synchronized void applyAutoClearBagLive() {
+        boolean on = config.isAutoClearBag();
+        if (!isOpen()) {
+            return;
+        }
+        Optional<Frame> gameFrame = locateGameFrame(true);
+        if (gameFrame.isEmpty()) {
+            log("自动清背包将在进入游戏后生效 " + config.displayName());
+            return;
+        }
+        try {
+            Frame frame = gameFrame.get();
+            evalGlobal(frame, Scripts.load(Scripts.AUTO_CLEAR_BAG));
+            String js = on
+                    ? "() => { try { window.WorldBagClear && WorldBagClear.start(); } catch (e) {} }"
+                    : "() => { try { window.WorldBagClear && WorldBagClear.stop(); } catch (e) {} }";
+            frame.evaluate(js);
+            log((on ? "自动清背包已开启（约8秒后首次清理，之后每60秒一次）"
+                    : "自动清背包已关闭") + " " + config.displayName());
+        } catch (Exception e) {
+            log("切换自动清背包失败 " + config.displayName() + ": " + e.getMessage());
+        }
+    }
+
+    // 手动立即清一次背包，返回本次出售件数并写日志。
+    public synchronized void clearBagNow() {
+        ensureOpen();
+        Optional<Frame> gameFrame = locateGameFrame(true);
+        if (gameFrame.isEmpty()) {
+            throw new IllegalStateException("还没进入游戏，无法清背包: " + config.displayName());
+        }
+        Frame frame = gameFrame.get();
+        evalGlobal(frame, Scripts.load(Scripts.AUTO_CLEAR_BAG));
+        Object result = frame.evaluate(
+                "() => { try { if (!window.WorldBagClear) return -1; return WorldBagClear.runNow(); } catch (e) { return -1; } }");
+        int sold = result instanceof Number number ? number.intValue() : -1;
+        if (sold < 0) {
+            log("清背包执行失败（游戏接口未就绪）" + config.displayName());
+        } else {
+            log("清背包完成，本次出售 " + sold + " 件 " + config.displayName());
+        }
+    }
+
+    public synchronized void enterCity() {
+        enterCity(true);
+    }
+
+    public synchronized void enterCity(boolean activateWindow) {
+        evaluateGameFrame("City.doEnterCity(xself.getId())", activateWindow);
+        log("已执行进城 " + config.displayName());
+    }
+
+    public synchronized void drawMicroReward() {
+        drawMicroReward(true);
+    }
+
+    public synchronized void drawMicroReward(boolean activateWindow) {
+        evaluateGameFrame("nato.Network.sendCmd(MsgHandler.createDrawMicroReward())",
+                activateWindow);
+        log("已领取微端奖励 " + config.displayName());
+    }
+
+    public void setSyncEventListener(java.util.function.Consumer<String> listener) {
+        this.syncEventListener = listener;
+    }
+
+    // 接收主控广播来的手势（归一化坐标 JSON），在本号游戏帧对应位置重放触摸事件。
+    // 只能在 playwright-worker 线程调用。
+    public synchronized void replaySyncEvent(String payload) {
+        if (!isOpen() || payload == null || payload.isBlank()) {
+            return;
+        }
+        Frame target = preferredReplayFrame();
+        if (target == null) {
+            return;
+        }
+        try {
+            target.evaluate(
+                    "(p) => { try { if (window.__worldSyncRecv) window.__worldSyncRecv(p); } catch (e) {} }",
+                    payload);
+        } catch (Exception ignored) {
+        }
+    }
+
+    // 同步重放是高频调用（拖动时节流到约 24ms 一次），优先复用轮询已跟踪到的游戏主页帧，
+    // 避免每次都遍历全部页面/iframe；定位不到时再全量兜底。
+    // 已跟踪游戏主页的主帧：纯本地对象访问，不产生任何跨进程往返。
+    private Frame activeMainGameFrame() {
+        try {
+            if (activePage != null && !activePage.isClosed()) {
+                Frame main = activePage.mainFrame();
+                if (main != null && isLikelyGameUrl(main.url())) {
+                    return main;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private Frame preferredReplayFrame() {
+        Frame cached = activeMainGameFrame();
+        if (cached != null) {
+            return cached;
+        }
+        return locateGameFrame(false).orElse(null);
+    }
+
+    // 同步关闭或异常时，松开本号可能残留的按下状态。
+    public synchronized void clearSyncGesture() {
+        if (!isOpen()) {
+            return;
+        }
+        for (Page candidate : activePages()) {
+            try {
+                if (candidate.isClosed()) {
+                    continue;
+                }
+                for (Frame frame : candidate.frames()) {
+                    try {
+                        frame.evaluate(
+                                "() => { try { window.__worldSyncClear && window.__worldSyncClear(); } catch (e) {} }");
+                    } catch (Exception ignored) {
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public synchronized String captureCurrentGameUrl() {
+        ensureOpen();
+        Optional<Frame> gameFrame = locateGameFrame(false);
+        if (gameFrame.isEmpty()) {
+            log("存号定位失败，当前各页面地址: " + describePagesForLog());
+            throw new IllegalStateException("当前页面里没有找到游戏地址，请先登录并进入游戏");
+        }
+        String url = gameFrame.get().url();
+        if (url == null || url.isBlank()) {
+            throw new IllegalStateException("游戏地址为空，请稍后重试");
+        }
+        return url;
+    }
+
+    private String describePagesForLog() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            for (Page p : activePages()) {
+                try {
+                    if (p.isClosed()) {
+                        continue;
+                    }
+                    sb.append("[page:").append(abridgeUrl(p.url()));
+                    for (Frame f : p.frames()) {
+                        try {
+                            sb.append(" | frame:").append(abridgeUrl(f.url()));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    sb.append("] ");
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return sb.length() == 0 ? "无打开的页面" : sb.toString();
+    }
+
+    private String abridgeUrl(String url) {
+        if (url == null) {
+            return "null";
+        }
+        return url.length() > 160 ? url.substring(0, 160) + "..." : url;
+    }
+
+    @Override
+    public synchronized void close() {
+        bootstrapped = false; scriptFlags = 0;
+        if (context != null) {
+            try {
+                context.close();
+            } catch (Exception ignored) {
+            }
+        }
+        context = null;
+        page = null;
+        activePage = null;
+        adoptedPages.clear();
+        cdpSession = null;
+        browserWindowId = null;
+        bootstrapped = false; scriptFlags = 0;
+        popupNotified = false;
+        log("已关闭 " + config.displayName());
+    }
+
+    private void onContextPage(Page attachedPage) {
+        attachedPage.onConsoleMessage(message -> {
+            try {
+                String type = message.type();
+                if ("error".equalsIgnoreCase(type) || "warning".equalsIgnoreCase(type)) {
+                    String text = message.text();
+                    if (text != null && !text.isBlank()) {
+                        log("页面" + ("error".equalsIgnoreCase(type) ? "错误" : "警告")
+                                + " " + config.displayName() + ": " + text);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        });
+        attachedPage.onPageError(error -> log(
+                "页面异常 " + config.displayName() + ": " + error));
+        attachedPage.onDialog(dialog -> {
+            try {
+                log("页面弹窗 " + config.displayName() + ": " + dialog.message());
+                dialog.accept();
+            } catch (Exception e) {
+                log("处理页面弹窗失败: " + e.getMessage());
+            }
+        });
+    }
+
+    // 标签页一出现就接管（不等脚本就绪），保证手机 UA/尺寸/位置尽早生效。
+    private void adoptOtherPages() {
+        try {
+            for (Page candidate : activePages()) {
+                if (candidate == page || candidate.isClosed()) {
+                    continue;
+                }
+                if (adoptedPages.add(candidate)) {
+                    adoptGamePage(candidate);
+                    if (!popupNotified) {
+                        popupNotified = true;
+                        log("检测到游戏在新窗口运行，已接管 " + config.displayName());
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    // 游戏在新标签页里运行时，给新窗口同样的手机 UA、外框尺寸和位置。
+    private void adoptGamePage(Page gamePage) {
+        if (gamePage == null || gamePage == page) {
+            return;
+        }
+        try {
+            CDPSession popupCdp = context.newCDPSession(gamePage);
+            JsonObject windowInfo = popupCdp.send("Browser.getWindowForTarget");
+            long popupWindowId = windowInfo.get("windowId").getAsLong();
+            JsonObject bounds = new JsonObject();
+            bounds.addProperty("left", windowX);
+            bounds.addProperty("top", windowY);
+            bounds.addProperty("width", windowOuterWidth);
+            bounds.addProperty("height", windowOuterHeight);
+            bounds.addProperty("windowState", "normal");
+            JsonObject boundsParams = new JsonObject();
+            boundsParams.addProperty("windowId", popupWindowId);
+            boundsParams.add("bounds", bounds);
+            popupCdp.send("Browser.setWindowBounds", boundsParams);
+
+            if (mobileUserAgent != null) {
+                JsonObject uaParams = new JsonObject();
+                uaParams.addProperty("userAgent", mobileUserAgent);
+                uaParams.add("userAgentMetadata", buildUserAgentMetadata(chromeVersion));
+                popupCdp.send("Network.enable", new JsonObject());
+                popupCdp.send("Network.setUserAgentOverride", uaParams);
+            }
+        } catch (Exception e) {
+            log("校正游戏新窗口失败 " + config.displayName() + ": " + e.getMessage());
+        }
+    }
+
+    private void configureMobileWindow() {
+        cdpSession = context.newCDPSession(page);
+        JsonObject windowInfo = cdpSession.send("Browser.getWindowForTarget");
+        browserWindowId = windowInfo.get("windowId").getAsLong();
+
+        String dimensionsJson = (String) page.evaluate("""
+                () => JSON.stringify({
+                    outerWidth: window.outerWidth,
+                    outerHeight: window.outerHeight,
+                    innerWidth: window.innerWidth,
+                    innerHeight: window.innerHeight
+                })
+                """);
+        JsonObject dimensions = JsonParser.parseString(dimensionsJson).getAsJsonObject();
+        int outerWidth = dimensions.get("outerWidth").getAsInt();
+        int outerHeight = dimensions.get("outerHeight").getAsInt();
+        int innerWidth = dimensions.get("innerWidth").getAsInt();
+        int innerHeight = dimensions.get("innerHeight").getAsInt();
+
+        this.chromeWidth = outerWidth >= innerWidth ? outerWidth - innerWidth : 16;
+        this.chromeHeight = outerHeight >= innerHeight ? outerHeight - innerHeight : 88;
+        windowOuterWidth = mobileWidth + this.chromeWidth;
+        windowOuterHeight = mobileHeight + this.chromeHeight;
+        windowX = gameBounds.x + Math.max(0, (gameBounds.width - windowOuterWidth) / 2);
+        windowY = gameBounds.y + Math.max(0, (gameBounds.height - windowOuterHeight) / 2);
+
+        String currentUserAgent = Objects.toString(page.evaluate("() => navigator.userAgent"), "");
+        Matcher matcher = CHROME_VERSION.matcher(currentUserAgent);
+        String chromeVersion = matcher.find() ? matcher.group(1) : "120";
+        this.chromeVersion = chromeVersion;
+        this.mobileUserAgent = "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                + "AppleWebKit/537.36 (KHTML, like Gecko) "
+                + "Chrome/" + chromeVersion + ".0.0.0 Mobile Safari/537.36";
+
+        JsonObject uaParams = new JsonObject();
+        uaParams.addProperty("userAgent", mobileUserAgent);
+        uaParams.add("userAgentMetadata", buildUserAgentMetadata(chromeVersion));
+        cdpSession.send("Network.enable", new JsonObject());
+        cdpSession.send("Network.setUserAgentOverride", uaParams);
+
+        forceWindowBounds();
+    }
+
+    private JsonObject buildUserAgentMetadata(String chromeVersion) {
+        JsonArray brands = new JsonArray();
+        brands.add(brand("Chromium", chromeVersion));
+        brands.add(brand("Google Chrome", chromeVersion));
+        brands.add(brand("Not/A)Brand", "99"));
+
+        JsonObject metadata = new JsonObject();
+        metadata.add("brands", brands);
+        metadata.add("fullVersionList", brands);
+        metadata.addProperty("platform", "Android");
+        metadata.addProperty("platformVersion", "13.0.0");
+        metadata.addProperty("architecture", "");
+        metadata.addProperty("model", "Pixel 7");
+        metadata.addProperty("mobile", true);
+        metadata.addProperty("bitness", "");
+        metadata.addProperty("wow64", false);
+        return metadata;
+    }
+
+    private JsonObject brand(String name, String version) {
+        JsonObject item = new JsonObject();
+        item.addProperty("brand", name);
+        item.addProperty("version", version);
+        return item;
+    }
+
+    private void forceWindowBounds() {
+        if (cdpSession == null || browserWindowId == null) {
+            return;
+        }
+        JsonObject bounds = new JsonObject();
+        bounds.addProperty("left", windowX);
+        bounds.addProperty("top", windowY);
+        bounds.addProperty("width", windowOuterWidth);
+        bounds.addProperty("height", windowOuterHeight);
+        bounds.addProperty("windowState", "normal");
+
+        JsonObject params = new JsonObject();
+        params.addProperty("windowId", browserWindowId);
+        params.add("bounds", bounds);
+        cdpSession.send("Browser.setWindowBounds", params);
+    }
+
+    private void forceWindowsForeground() {
+        Path scriptFile = null;
+        try {
+            scriptFile = Files.createTempFile("world-force-front-", ".ps1");
+            try (InputStream input = getClass().getClassLoader()
+                    .getResourceAsStream("scripts/force_front.ps1")) {
+                if (input == null) {
+                    throw new IllegalStateException("缺少强制前置脚本");
+                }
+                Files.write(scriptFile, input.readAllBytes());
+            }
+
+            Process process = new ProcessBuilder(
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass",
+                    "-File", scriptFile.toString(),
+                    "-ProfileDir", profileDir.toString())
+                    .redirectErrorStream(true)
+                    .start();
+            try (InputStream input = process.getInputStream()) {
+                input.readAllBytes();
+            }
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        } catch (Exception e) {
+            log("Windows 强制前置失败 " + config.displayName() + ": " + e.getMessage());
+        } finally {
+            if (scriptFile != null) {
+                try {
+                    Files.deleteIfExists(scriptFile);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void ensureOpen() {
+        if (!isOpen()) {
+            throw new IllegalStateException("账号尚未打开: " + config.displayName());
+        }
+    }
+
+    private boolean hasOfficialCredentials() {
+        return config.getChannel() == Channel.GUANFANG
+                && officialUsername != null && !officialUsername.isBlank()
+                && officialPassword != null && !officialPassword.isBlank();
+    }
+
+    // 重启后没有走“导号”时，用存号保存的官服账号密码回填，实现同样的自动登录。
+    private void hydrateOfficialCredentials() {
+        if (config.getChannel() != Channel.GUANFANG) {
+            return;
+        }
+        boolean sessionEmpty = officialUsername == null || officialUsername.isBlank();
+        if (sessionEmpty && config.getUsername() != null && !config.getUsername().isBlank()) {
+            officialUsername = config.getUsername().trim();
+            officialPassword = config.getPassword() == null ? "" : config.getPassword().trim();
+            resetOfficialAutomationState();
+        }
+    }
+
+    private String officialAccountStorageScript() {
+        JsonObject savedAccount = new JsonObject();
+        savedAccount.addProperty("account", officialUsername);
+        savedAccount.addProperty("passwd", officialPassword);
+        JsonArray savedAccounts = new JsonArray();
+        savedAccounts.add(savedAccount);
+
+        String accountKey = "world-1000-121-accountList";
+        String accountValue = GSON.toJson(GSON.toJson(savedAccounts));
+        return "(() => {"
+                + "  try {"
+                + "    if (location.hostname.indexOf('gamehz.cn') >= 0) {"
+                + "      sessionStorage.clear();"
+                + "      for (let i = localStorage.length - 1; i >= 0; i--) {"
+                + "        const key = localStorage.key(i);"
+                + "        if (key && key !== " + GSON.toJson(accountKey) + ") {"
+                + "          localStorage.removeItem(key);"
+                + "        }"
+                + "      }"
+                + "    }"
+                + "    localStorage.setItem(" + GSON.toJson(accountKey) + ", "
+                + GSON.toJson(accountValue) + ");"
+                + "  } catch (e) {}"
+                + "})();";
+    }
+
+    private void navigateOfficialLoginPage() {
+        context.clearCookies();
+        page.navigate(config.getChannel().loginUrl());
+        try {
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+            page.evaluate(officialAccountStorageScript());
+            page.reload();
+        } catch (Exception e) {
+            log("\u9884\u7f6e\u5b98\u670d\u8d26\u53f7\u7f13\u5b58\u5931\u8d25 " + config.displayName() + ": " + e.getMessage());
+        }
+    }
+
+
+
+    private void pollOfficialAutomation(Frame frame) {
+        if (config.getChannel() != Channel.GUANFANG
+                || officialUsername == null || officialUsername.isBlank()
+                || officialPassword == null || officialPassword.isBlank()) {
+            return;
+        }
+
+        try {
+            if (!officialLoginSubmitted) {
+                String phaseScript = """
+                        (() => {
+                            try {
+                                if (typeof xself !== 'undefined' && typeof Control !== 'undefined'
+                                        && typeof nato !== 'undefined' && xself) {
+                                    return 'game';
+                                }
+                                const loginObject = typeof Login !== 'undefined' ? Login.instance : null;
+                                const roleScene = loginObject && loginObject.selectRoleScene;
+                                if (roleScene && roleScene.stage && roleScene.visible !== false) {
+                                    return 'role';
+                                }
+                                if (typeof LoginPanel !== 'undefined' && typeof PanelManager !== 'undefined') {
+                                    const panel = PanelManager.getPanel(LoginPanel);
+                                    if (panel && panel.stage && panel.parent && panel.visible !== false) {
+                                        return 'login';
+                                    }
+                                }
+                                return 'loading';
+                            } catch (e) {
+                                return 'loading';
+                            }
+                        })()
+                        """;
+                Object phase = frame.evaluate(phaseScript);
+                if ("game".equals(String.valueOf(phase))) {
+                    officialLoginSubmitted = true;
+                    roleEnterSubmitted = true;
+                    return;
+                }
+                if ("role".equals(String.valueOf(phase))) {
+                    officialLoginSubmitted = true;
+                } else if (!"login".equals(String.valueOf(phase))) {
+                    return;
+                }
+            }
+            if (!officialLoginSubmitted) {
+                String loginScript = """
+                        (() => {
+                            try {
+                                if (typeof LoginPanel === 'undefined'
+                                        || typeof PanelManager === 'undefined') {
+                                    return 'wait';
+                                }
+                                const panel = PanelManager.getPanel(LoginPanel);
+                                if (!panel || !panel.input_account || !panel.input_password) {
+                                    return 'wait';
+                                }
+                                const shown = (PanelManager.isPanelShow
+                                        && PanelManager.isPanelShow(LoginPanel))
+                                        || (panel.stage && panel.parent && panel.visible !== false);
+                                if (!shown) {
+                                    return 'wait';
+                                }
+                                panel.updateTips && panel.updateTips('');
+                                panel.input_account.text = __WORLD_USERNAME__;
+                                panel.input_password.text = __WORLD_PASSWORD__;
+                                if (typeof GameWorld !== 'undefined') {
+                                    GameWorld.username = __WORLD_USERNAME__;
+                                    GameWorld.password = __WORLD_PASSWORD__;
+                                }
+                                panel.login();
+                                return 'submitted';
+                            } catch (e) {
+                                return 'error:' + (e && e.message ? e.message : e);
+                            }
+                        })()
+                        """
+                        .replace("__WORLD_USERNAME__", GSON.toJson(officialUsername))
+                        .replace("__WORLD_PASSWORD__", GSON.toJson(officialPassword));
+                Object result = frame.evaluate(loginScript);
+                if ("submitted".equals(String.valueOf(result))) {
+                    officialLoginSubmitted = true;
+                    log("官服账号密码已提交 " + config.displayName());
+                } else if (String.valueOf(result).startsWith("error:")) {
+                    log("自动登录暂未触发 " + config.displayName() + ": " + result);
+                }
+                return;
+            }
+
+            Object gameReady = frame.evaluate(
+                    "() => typeof xself !== 'undefined' && typeof Control !== 'undefined' "
+                            + "&& typeof nato !== 'undefined' && !!xself");
+            if (Boolean.TRUE.equals(gameReady)) {
+                roleEnterSubmitted = true;
+                return;
+            }
+
+            String alertScript = """
+                    (() => {
+                        try {
+                            if (typeof AlertPanel !== 'undefined'
+                                    && AlertPanel.instance && AlertPanel.instance.stage) {
+                                AlertPanel.instance.onBtnOkTouch
+                                    && AlertPanel.instance.onBtnOkTouch();
+                                return 'ok';
+                            }
+                        } catch (e) {}
+                        return 'none';
+                    })()
+                    """;
+            frame.evaluate(alertScript);
+
+            if (!roleEnterSubmitted) {
+                String loginPanelScript = """
+                        (() => {
+                            try {
+                                if (typeof LoginPanel === 'undefined'
+                                        || typeof PanelManager === 'undefined') {
+                                    return 'gone';
+                                }
+                                const panel = PanelManager.getPanel(LoginPanel);
+                                if (!panel || !panel.stage || !panel.parent
+                                        || panel.visible === false) {
+                                    return 'gone';
+                                }
+                                let tip = '';
+                                try {
+                                    tip = panel.tips && panel.tips.text ? String(panel.tips.text) : '';
+                                } catch (ignored) {}
+                                return tip ? 'tip:' + tip : 'login';
+                            } catch (e) {
+                                return 'gone';
+                            }
+                        })()
+                        """;
+                String loginPanelState = String.valueOf(frame.evaluate(loginPanelScript));
+                if ("login".equals(loginPanelState)) {
+                    return;
+                }
+                if (loginPanelState.startsWith("tip:")) {
+                    if (!loginTipNotified) {
+                        loginTipNotified = true;
+                        log("\u767b\u5f55\u672a\u6210\u529f " + config.displayName() + ": "
+                                + loginPanelState.substring(4));
+                    }
+                    return;
+                }
+
+                String captchaScript = """
+                        (() => {
+                            try {
+                                if (typeof ImgCheckPanel !== 'undefined'
+                                        && typeof PanelManager !== 'undefined'
+                                        && PanelManager.isPanelShow
+                                        && PanelManager.isPanelShow(ImgCheckPanel)) {
+                                    return 'captcha';
+                                }
+                                return 'ok';
+                            } catch (e) {
+                                return 'ok';
+                            }
+                        })()
+                        """;
+                if ("captcha".equals(String.valueOf(frame.evaluate(captchaScript)))) {
+                    if (!captchaNotified) {
+                        captchaNotified = true;
+                        log("账号触发图形验证码，请在窗口中手动处理 " + config.displayName());
+                    }
+                    return;
+                }
+
+                String roleScript = """
+                        (() => {
+                            try {
+                                if (typeof Login === 'undefined' || !Login.instance) {
+                                    return 'wait';
+                                }
+                                const login = Login.instance;
+                                const createScene = login.createRoleScene;
+                                if (createScene && createScene.stage
+                                        && createScene.visible !== false) {
+                                    return 'create-role';
+                                }
+                                const scene = login.selectRoleScene;
+                                if (!scene || !scene.stage || scene.visible === false
+                                        || !scene.parent) {
+                                    return 'wait';
+                                }
+                                const players = login.allPlayerList || [];
+                                if (!players.length) {
+                                    return 'wait';
+                                }
+                                let player = players[0];
+                                try {
+                                    const normal = ModelConst && ModelConst.STATUS_NORMAL;
+                                    if (normal !== undefined) {
+                                        player = players.find(p => p
+                                            && typeof p.getStatus === 'function'
+                                            && p.getStatus() === normal) || player;
+                                    }
+                                } catch (ignored) {}
+                                scene.selectedPlayer = player;
+                                scene.updatePlayerInfo && scene.updatePlayerInfo();
+                                scene.onEnterGame && scene.onEnterGame(null);
+                                try {
+                                    if (typeof AlertPanel !== 'undefined'
+                                            && AlertPanel.instance && AlertPanel.instance.stage) {
+                                        AlertPanel.instance.onBtnOkTouch
+                                            && AlertPanel.instance.onBtnOkTouch();
+                                    }
+                                } catch (ignored) {}
+                                return 'entered';
+                            } catch (e) {
+                                return 'error:' + (e && e.message ? e.message : e);
+                            }
+                        })()
+                        """;
+                Object result = frame.evaluate(roleScript);
+                String value = String.valueOf(result);
+                if ("entered".equals(value)) {
+                    roleEnterSubmitted = true;
+                    log("已自动选择角色并进入游戏 " + config.displayName());
+                } else if ("create-role".equals(value)) {
+                    if (!createRoleNotified) {
+                        createRoleNotified = true;
+                        log("账号尚未创建角色，请手动创建后继续 " + config.displayName());
+                    }
+                } else if (value.startsWith("error:")) {
+                    log("自动选角暂未触发 " + config.displayName() + ": " + value);
+                }
+            }
+        } catch (Exception e) {
+            // 游戏资源还在加载时，部分全局对象会短暂不可用，下一轮继续。
+        }
+    }
+
+
+
+    private List<Page> activePages() {
+        List<Page> result = new ArrayList<>();
+        try {
+            if (context != null) {
+                List<Page> contextPages = context.pages();
+                if (contextPages != null) {
+                    result.addAll(contextPages);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        if (page != null && !result.contains(page)) {
+            result.add(page);
+        }
+        result.removeIf(Objects::isNull);
+        return result;
+    }
+
+    private boolean isLikelyGameUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return false;
+        }
+        String lower = url.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("about:") || lower.startsWith("chrome:")
+                || lower.startsWith("devtools:") || lower.startsWith("edge:")
+                || lower.startsWith("data:")) {
+            return false;
+        }
+        return lower.contains(GAME_URL_MARKER)
+                || lower.contains("worldh5.gamehz.cn")
+                || lower.contains("gamehz.cn/version/world")
+                || lower.contains("/version/world/publish/channel/res/index.html")
+                || (lower.contains("xameid=") && lower.contains("xhannel="));
+    }
+
+    private boolean frameHasGameGlobals(Frame frame) {
+        try {
+            Object ready = frame.evaluate(
+                    "() => typeof xself !== 'undefined' && typeof Control !== 'undefined' "
+                            + "&& typeof nato !== 'undefined' && !!xself");
+            return Boolean.TRUE.equals(ready);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // requireReady=true 只返回 xself/Control/nato 已就绪的帧（用于注入与脚本操作）；
+    // false 时只要 URL 命中游戏地址即可（用于存号）。顶层游戏页优先级高于嵌套 iframe。
+    private Optional<Frame> locateGameFrame(boolean requireReady) {
+        Frame best = null;
+        Page bestPage = null;
+        int bestScore = -1;
+        for (Page candidate : activePages()) {
+            List<Frame> frames;
+            try {
+                if (candidate.isClosed()) {
+                    continue;
+                }
+                frames = new ArrayList<>(candidate.frames());
+            } catch (Exception e) {
+                continue;
+            }
+            Frame mainFrame;
+            try {
+                mainFrame = candidate.mainFrame();
+            } catch (Exception e) {
+                mainFrame = null;
+            }
+            for (Frame frame : frames) {
+                String frameUrl;
+                try {
+                    frameUrl = frame.url();
+                } catch (Exception e) {
+                    continue;
+                }
+                if (!isLikelyGameUrl(frameUrl)) {
+                    continue;
+                }
+                boolean globalsReady = frameHasGameGlobals(frame);
+                if (requireReady && !globalsReady) {
+                    continue;
+                }
+                int score = (globalsReady ? 2 : 0) + (frame == mainFrame ? 1 : 0);
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = frame;
+                    bestPage = candidate;
+                }
+            }
+        }
+        if (best != null && bestScore >= 3) {
+            trackGamePage(bestPage);
+        }
+        return Optional.ofNullable(best);
+    }
+
+    private void trackGamePage(Page gamePage) {
+        if (gamePage != null && gamePage != activePage) {
+            activePage = gamePage;
+        }
+    }
+
+    private Optional<Frame> findGameFrame() {
+        return locateGameFrame(false);
+    }
+
+    private void evaluateGameFrame(String script, boolean activateWindow) {
+        ensureOpen();
+        Optional<Frame> frame = locateGameFrame(false);
+        if (frame.isEmpty()) {
+            throw new IllegalStateException(
+                    "还没进入游戏页面，请先登录进入游戏: " + config.displayName());
+        }
+        evalGlobal(frame.get(), script);
+        if (activateWindow) {
+            bringToFront();
+        }
+    }
+
+    private void injectBootstrap(Frame frame) {
+        frame.waitForLoadState(LoadState.DOMCONTENTLOADED);
+
+        // 与原 APK WorldActivity 中的注入顺序保持一致。
+        evalGlobal(frame, Scripts.load(Scripts.SPEED));
+        evalGlobal(frame, Scripts.load(Scripts.LOTTERY_CIRCLE));
+        // 清背包库始终注入（仅定义 window.WorldBagClear，不 start 不会出售任何物品），
+        // 再按账号配置决定是否启动定时清理。
+        evalGlobal(frame, Scripts.load(Scripts.AUTO_CLEAR_BAG));
+        if (config.isAutoClearBag()) {
+            evalGlobal(frame, "try{window.WorldBagClear&&WorldBagClear.start();}catch(e){}");
+        }
+        evalGlobal(frame, Scripts.load(Scripts.ONLINE_REWARD_1));
+        evalGlobal(frame, Scripts.load(Scripts.ONLINE_REWARD_2));
+        evalGlobal(frame, Scripts.load(Scripts.LOGIN_LOTTERY_DRAW));
+        evalGlobal(frame, Scripts.load(Scripts.REFRESH_GAME));
+        evalGlobal(frame, Scripts.load(Scripts.LOOP_GAME));
+        evalGlobal(frame, Scripts.load(Scripts.AUTO_GAME));
+        evalGlobal(frame, Scripts.load(Scripts.MISSION_LOG));
+
+        frame.evaluate("() => { window.__worldDesktopBooted = true; }");
+        bootstrapped = true;
+        log("脚本环境已注入 " + config.displayName());
+    }
+
+    // Playwright 会把字符串当作 JS 表达式求值，像 "var TestAutoGame = ..." 这样的语句
+    // 直接 evaluate 会报语法错误；间接 eval 在全局作用域执行，var/function 会挂到 window，
+    // 行为与 Android WebView 的 evaluateJavascript 一致。
+    private static void evalGlobal(Frame frame, String script) {
+        frame.evaluate("(0,eval)(" + GSON.toJson(script) + ")");
+    }
+
+    private void installRedirectScripts() {
+        // addInitScript 会自动注入当前 BrowserContext 的每个 Frame，包括跨域游戏 Frame。
+        // 手机 UA 下游戏只认 touch 事件；这里把桌面鼠标事件桥接成 touchstart/touchmove/touchend。
+        context.addInitScript("window.__worldGameScale=" + gameScale + ";");
+        context.addInitScript(Scripts.load(Scripts.GAME_SCALE));
+        context.addInitScript(Scripts.load(Scripts.TOUCH_BRIDGE));
+        // 同步操作：每个帧都具备“采集自己的手势”和“重放别人手势”的能力，
+        // 是否真正广播由 SessionManager 的总开关控制（物理鼠标只会落到最前窗口）。
+        context.addInitScript(Scripts.load(Scripts.SYNC_REPLAY));
+        context.addInitScript(Scripts.load(Scripts.SYNC_CAPTURE));
+
+        if (forceFreshLogin) {
+            context.addInitScript(officialAccountStorageScript());
+        }
+
+        if (config.getChannel() == Channel.TIANYU) {
+            context.addInitScript(Scripts.load(Scripts.TIANYU_IFRAME));
+        } else if (config.getChannel() == Channel.XIAOQI) {
+            context.addInitScript(Scripts.load(Scripts.XIAOQI_IFRAME));
+        }
+    }
+
+    private void log(String message) {
+        logger.accept(message);
+    }
+}

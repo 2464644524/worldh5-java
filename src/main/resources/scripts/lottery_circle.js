@@ -1,0 +1,1 @@
+LoginLotteryPanel.CIRCLE = 16

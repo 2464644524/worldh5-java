@@ -1,0 +1,1 @@
+var autoInputAccountTimer=setInterval(function(){if(PanelManager.getPanel(LoginPanel).input_account.textArr.length>=1&&PanelManager.getPanel(LoginPanel).input_account.textArr[0].text.length>=1){clearInterval(autoInputAccountTimer)}PanelManager.getPanel(LoginPanel).input_account.text='
