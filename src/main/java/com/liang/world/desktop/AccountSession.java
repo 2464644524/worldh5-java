@@ -58,6 +58,7 @@ public class AccountSession implements AutoCloseable {
     private boolean createRoleNotified;
     private boolean captchaNotified;
     private boolean loginTipNotified;
+    private String lastLoginTraceStage = "";
     // 仅“导号换号”这一次打开需要清 Cookie/本地存储；平时打开沿用已登录会话。
     private boolean forceFreshLogin;
 
@@ -225,6 +226,7 @@ public class AccountSession implements AutoCloseable {
         createRoleNotified = false;
         captchaNotified = false;
         loginTipNotified = false;
+        lastLoginTraceStage = "";
     }
 
 
@@ -283,6 +285,7 @@ public class AccountSession implements AutoCloseable {
         page = context.pages().isEmpty() ? context.newPage() : context.pages().get(0);
         activePage = page;
         popupNotified = false;
+        lastLoginTraceStage = "";
         adoptedPages.clear();
         adoptedPages.add(page);
         // 游戏选角后可能 window.open 弹出真正的游戏标签页，统一接管 context 里所有页面。
@@ -311,6 +314,18 @@ public class AccountSession implements AutoCloseable {
             }
             return null;
         });
+        context.exposeFunction("__worldTrace", args -> {
+            try {
+                if (args != null && args.length > 0 && args[0] != null) {
+                    String text = String.valueOf(args[0]);
+                    if (!text.isBlank()) {
+                        traceLoginEvent(text);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            return null;
+        });
         context.onPage(this::onContextPage);
         onContextPage(page);
         hydrateOfficialCredentials();
@@ -324,6 +339,8 @@ public class AccountSession implements AutoCloseable {
         // 换号清理只对本次打开生效（init 脚本已装配），之后普通“打开/刷新”沿用已登录会话。
         boolean freshLogin = forceFreshLogin;
         forceFreshLogin = false;
+        traceLoginEvent("开始打开" + config.getChannel().displayName()
+                + "渠道地址：" + safeUrlForLog(config.startupUrl()));
         page.navigate(config.startupUrl());
         bringToFront();
         if (freshLogin && config.getChannel() == Channel.GUANFANG) {
@@ -335,11 +352,13 @@ public class AccountSession implements AutoCloseable {
     public synchronized void login() {
         ensureOpen();
         bootstrapped = false; scriptFlags = 0;
+        lastLoginTraceStage = "";
         if (config.getChannel() == Channel.GUANFANG
                 && officialUsername != null && !officialUsername.isBlank()
                 && officialPassword != null && !officialPassword.isBlank()) {
             resetOfficialAutomationState();
         }
+        traceLoginEvent("进入渠道登录页：" + safeUrlForLog(config.getChannel().loginUrl()));
         page.navigate(config.getChannel().loginUrl());
         bringToFront();
         log("进入登录页 " + config.displayName());
@@ -763,7 +782,7 @@ public class AccountSession implements AutoCloseable {
         return sb.length() == 0 ? "无打开的页面" : sb.toString();
     }
 
-    private String abridgeUrl(String url) {
+    private static String abridgeUrl(String url) {
         if (url == null) {
             return "null";
         }
@@ -1004,6 +1023,50 @@ public class AccountSession implements AutoCloseable {
                 && officialPassword != null && !officialPassword.isBlank();
     }
 
+    private void traceLoginStage(String stage) {
+        if (stage == null || stage.isBlank() || stage.equals(lastLoginTraceStage)) {
+            return;
+        }
+        lastLoginTraceStage = stage;
+        traceLoginEvent(stage);
+    }
+
+    private void traceLoginEvent(String text) {
+        if (text == null || text.isBlank()) {
+            return;
+        }
+        String message = "[登录] " + config.displayName() + " " + text;
+        log(message);
+        LoginTraceLog.append(config.displayName(), text);
+    }
+
+    private static String safeUrlForLog(String url) {
+        if (url == null || url.isBlank()) {
+            return "";
+        }
+        try {
+            java.net.URI uri = java.net.URI.create(url);
+            StringBuilder sb = new StringBuilder();
+            if (uri.getScheme() != null) {
+                sb.append(uri.getScheme()).append("://");
+            }
+            if (uri.getHost() != null) {
+                sb.append(uri.getHost());
+            }
+            if (uri.getPath() != null) {
+                sb.append(uri.getPath());
+            }
+            String result = sb.toString();
+            return result.isBlank() ? abridgeUrl(url) : result;
+        } catch (Exception e) {
+            int cut = url.length();
+            int q = url.indexOf('?');
+            int h = url.indexOf('#');
+            if (q >= 0) cut = Math.min(cut, q);
+            if (h >= 0) cut = Math.min(cut, h);
+            return url.substring(0, Math.min(160, cut));
+        }
+    }
     // 重启后没有走“导号”时，用存号保存的官服账号密码回填，实现同样的自动登录。
     private void hydrateOfficialCredentials() {
         if (config.getChannel() != Channel.GUANFANG) {
@@ -1091,15 +1154,23 @@ public class AccountSession implements AutoCloseable {
                         })()
                         """;
                 Object phase = frame.evaluate(phaseScript);
-                if ("game".equals(String.valueOf(phase))) {
-                    officialLoginSubmitted = true;
-                    roleEnterSubmitted = true;
-                    return;
-                }
-                if ("role".equals(String.valueOf(phase))) {
-                    officialLoginSubmitted = true;
-                } else if (!"login".equals(String.valueOf(phase))) {
-                    return;
+                String phaseValue = String.valueOf(phase);
+                switch (phaseValue) {
+                    case "game" -> {
+                        traceLoginStage("官服游戏核心对象就绪");
+                        officialLoginSubmitted = true;
+                        roleEnterSubmitted = true;
+                        return;
+                    }
+                    case "role" -> {
+                        traceLoginStage("官服选择角色界面");
+                        officialLoginSubmitted = true;
+                    }
+                    case "login" -> traceLoginStage("官服账号密码登录面板");
+                    default -> {
+                        traceLoginStage("官服登录资源加载中");
+                        return;
+                    }
                 }
             }
             if (!officialLoginSubmitted) {
@@ -1139,7 +1210,7 @@ public class AccountSession implements AutoCloseable {
                 Object result = frame.evaluate(loginScript);
                 if ("submitted".equals(String.valueOf(result))) {
                     officialLoginSubmitted = true;
-                    log("官服账号密码已提交 " + config.displayName());
+                    traceLoginEvent("官服账号密码已提交（仅记录动作，不记录密码）");
                 } else if (String.valueOf(result).startsWith("error:")) {
                     log("自动登录暂未触发 " + config.displayName() + ": " + result);
                 }
@@ -1199,8 +1270,7 @@ public class AccountSession implements AutoCloseable {
                 if (loginPanelState.startsWith("tip:")) {
                     if (!loginTipNotified) {
                         loginTipNotified = true;
-                        log("\u767b\u5f55\u672a\u6210\u529f " + config.displayName() + ": "
-                                + loginPanelState.substring(4));
+                        traceLoginEvent("登录未成功：" + loginPanelState.substring(4));
                     }
                     return;
                 }
@@ -1223,7 +1293,7 @@ public class AccountSession implements AutoCloseable {
                 if ("captcha".equals(String.valueOf(frame.evaluate(captchaScript)))) {
                     if (!captchaNotified) {
                         captchaNotified = true;
-                        log("账号触发图形验证码，请在窗口中手动处理 " + config.displayName());
+                        traceLoginEvent("账号触发图形验证码，请在窗口中手动处理");
                     }
                     return;
                 }
@@ -1247,7 +1317,7 @@ public class AccountSession implements AutoCloseable {
                                 }
                                 const players = login.allPlayerList || [];
                                 if (!players.length) {
-                                    return 'wait';
+                                    return 'wait-players';
                                 }
                                 let player = players[0];
                                 try {
@@ -1276,16 +1346,18 @@ public class AccountSession implements AutoCloseable {
                         """;
                 Object result = frame.evaluate(roleScript);
                 String value = String.valueOf(result);
-                if ("entered".equals(value)) {
+                if ("wait-players".equals(value)) {
+                    traceLoginStage("选择角色界面已出现，等待角色列表");
+                } else if ("entered".equals(value)) {
                     roleEnterSubmitted = true;
-                    log("已自动选择角色并进入游戏 " + config.displayName());
+                    traceLoginEvent("已自动选择角色并请求进入游戏");
                 } else if ("create-role".equals(value)) {
                     if (!createRoleNotified) {
                         createRoleNotified = true;
-                        log("账号尚未创建角色，请手动创建后继续 " + config.displayName());
+                        traceLoginEvent("账号尚未创建角色，请手动创建后继续");
                     }
                 } else if (value.startsWith("error:")) {
-                    log("自动选角暂未触发 " + config.displayName() + ": " + value);
+                    traceLoginEvent("自动选角暂未触发：" + value);
                 }
             }
         } catch (Exception e) {
@@ -1436,7 +1508,7 @@ public class AccountSession implements AutoCloseable {
 
         frame.evaluate("() => { window.__worldDesktopBooted = true; }");
         bootstrapped = true;
-        log("脚本环境已注入 " + config.displayName());
+        traceLoginEvent("脚本环境已注入，登录/进游戏流程完成");
     }
 
     // Playwright 会把字符串当作 JS 表达式求值，像 "var TestAutoGame = ..." 这样的语句
@@ -1447,6 +1519,8 @@ public class AccountSession implements AutoCloseable {
     }
 
     private void installRedirectScripts() {
+        // 登录追踪必须最早注入，用于记录渠道跳转、登录/选角阶段和用户手动点击位置。
+        context.addInitScript(Scripts.load(Scripts.LOGIN_TRACE));
         // addInitScript 会自动注入当前 BrowserContext 的每个 Frame，包括跨域游戏 Frame。
         // 手机 UA 下游戏只认 touch 事件；这里把桌面鼠标事件桥接成 touchstart/touchmove/touchend。
         context.addInitScript("window.__worldGameScale=" + gameScale + ";");

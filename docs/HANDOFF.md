@@ -393,3 +393,21 @@ hook 只在注入后的游戏帧生效，需重开窗口。
 - `AccountSession` 新增 `isInCity()`、`enterCityIfNeeded(boolean)`、`stopScriptsIfInGame(boolean)`。
 - UI 顶部当前账号行会显示托管阶段和已运行时长；按钮运行中变橙色并显示“停管·槽位”。
 - 登录/选角等待超时 10 分钟；进城超时 60 秒；自动启动确认 30 秒。后续 A/B 判定和自动切号在此状态机上继续扩展。
+
+---
+
+## 14. 登录/选角/进游戏过程追踪日志（2026-09-17 22:46:52 CST）
+
+目的：用户要求先记录“人工到底怎么进入游戏”，用于后续补齐自动登录和单号托管的前置阶段。
+
+实现：
+- 新增 `scripts/login_trace.js`，通过 `addInitScript` 对所有页面/Frame 尽早注入；只追踪到游戏核心对象就绪前，就绪后停止轮询。
+- 新增 Playwright 绑定 `__worldTrace(text)`，由 `AccountSession.traceLoginEvent()` 统一输出：
+  1. 右侧控制台日志，前缀 `[登录]`；
+  2. 持久化文件 `data/登录流程.txt`（git 已忽略，不进仓库）。
+- 记录内容：渠道打开、不含 query/hash 的安全 URL 跳转、登录面板、图形验证码、选角界面、创建角色界面、角色列表等待、自动/手动点击、脚本注入完成。
+- 安全：不记录 URL query/hash（天宇 URL token 在 query 中），不记录输入框值和密码；密码框只显示 `***`。
+- 手动点击记录 DOM 标签、按钮文本/id/role；Canvas 点击记录相对画布归一化坐标，便于复盘在画面上点了哪里。
+- 官服自动登录阶段增加状态变化日志：资源加载、账号密码面板、提交动作、验证码、选角、角色列表、请求进入游戏。
+
+验证：`mvn -q clean compile` 与 `node --check login_trace.js` 通过。新增日志只对新打开窗口生效，需完全关闭控制台和 Edge 后重启。

@@ -17,6 +17,7 @@ public final class Scripts {
     public static final String TIANYU_IFRAME = "scripts/tianyu_iframe.js";
     public static final String XIAOQI_IFRAME = "scripts/xiaoqi_iframe.js";
     public static final String TOUCH_BRIDGE = "scripts/touch_bridge.js";
+    public static final String LOGIN_TRACE = "scripts/login_trace.js";
     public static final String GAME_SCALE = "scripts/game_scale.js";
     public static final String SYNC_CAPTURE = "scripts/sync_capture.js";
     public static final String SYNC_REPLAY = "scripts/sync_replay.js";
