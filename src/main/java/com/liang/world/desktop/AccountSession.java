@@ -56,6 +56,9 @@ public class AccountSession implements AutoCloseable {
     private String officialPassword = "";
     private boolean officialLoginSubmitted;
     private boolean roleEnterSubmitted;
+    private long loadingSceneFirstSeenAt;
+    private long loadingActionAt;
+    private int loadingClickCount;
     private long roleSceneFirstSeenAt;
     private long roleFallbackActionAt;
     private int roleFallbackStep;
@@ -228,6 +231,9 @@ public class AccountSession implements AutoCloseable {
     private void resetOfficialAutomationState() {
         officialLoginSubmitted = false;
         roleEnterSubmitted = false;
+        loadingSceneFirstSeenAt = 0L;
+        loadingActionAt = 0L;
+        loadingClickCount = 0;
         roleSceneFirstSeenAt = 0L;
         roleFallbackActionAt = 0L;
         roleFallbackStep = 0;
@@ -404,17 +410,13 @@ public class AccountSession implements AutoCloseable {
             }
         }
 
-        // 慢车道：登录页 / 加载中 / 刚跳转，才全量定位游戏帧、自动填账号、注入脚本。
-        Optional<Frame> gameFrame = locateGameFrame(false);
+        // 慢车道：登录页 / 加载中 / 刚跳转。扫描所有页面和 Frame，
+        // 因为天宇加载页的第一次“进入游戏”点击可能发生在选角场景对象就绪前。
+        Optional<Frame> gameFrame = pollLoginAutomationAcrossFrames();
         if (gameFrame.isEmpty()) {
             return;
         }
         Frame frame = gameFrame.get();
-        String loginPhase = pollLoginAutomation(frame);
-        if (!"game".equals(loginPhase)) {
-            // 登录面板/验证码/创建角色/选择角色期间绝不能提前注入加速和任务脚本。
-            return;
-        }
         try {
             Object ready = frame.evaluate(
                     "() => typeof xself !== 'undefined' && typeof Control !== 'undefined' "
@@ -1221,15 +1223,67 @@ public class AccountSession implements AutoCloseable {
             })()
             """;
 
-    // 实测天宇直链进游戏：画布 (0.436,0.870) 选角色，(0.557,0.929) 点进入游戏。
-    private static final double ROLE_CARD_X = 0.436D;
-    private static final double ROLE_CARD_Y = 0.870D;
+    // 实测天宇直链进游戏：
+    // 加载页先点 (0.436,0.870) 的“进入游戏”，选角页出现后点 (0.557,0.929) 进入游戏。
+    private static final double LOADING_ENTER_X = 0.436D;
+    private static final double LOADING_ENTER_Y = 0.870D;
     private static final double ROLE_ENTER_X = 0.557D;
     private static final double ROLE_ENTER_Y = 0.929D;
 
-    private String pollLoginAutomation(Frame frame) {
+    private Optional<Frame> pollLoginAutomationAcrossFrames() {
+        Frame bestFrame = null;
+        Page bestPage = null;
+        String bestPhase = "loading";
+        int bestScore = -1;
+
+        for (Page candidate : activePages()) {
+            List<Frame> frames;
+            try {
+                if (candidate.isClosed()) {
+                    continue;
+                }
+                frames = new ArrayList<>(candidate.frames());
+            } catch (Exception e) {
+                continue;
+            }
+
+            for (Frame frame : frames) {
+                try {
+                    String frameUrl = frame.url();
+                    if (!isLikelyGameUrl(frameUrl)) {
+                        continue;
+                    }
+                    String phase = String.valueOf(frame.evaluate(LOGIN_PHASE_SCRIPT));
+                    int score = switch (phase) {
+                        case "game" -> 6;
+                        case "role" -> 5;
+                        case "captcha" -> 4;
+                        case "create-role" -> 3;
+                        case "login" -> 2;
+                        default -> 0;
+                    };
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestPhase = phase;
+                        bestFrame = frame;
+                        bestPage = candidate;
+                    }
+                } catch (Exception ignored) {
+                    // 跨域或正在加载的 Frame 下一轮继续。
+                }
+            }
+        }
+
+        if (bestFrame == null) {
+            return Optional.empty();
+        }
+        trackGamePage(bestPage);
+        String resultingPhase = pollLoginAutomation(bestFrame, bestPhase);
+        return "game".equals(resultingPhase) ? Optional.of(bestFrame) : Optional.empty();
+    }
+
+    private String pollLoginAutomation(Frame frame, String phase) {
         try {
-            String phase = String.valueOf(frame.evaluate(LOGIN_PHASE_SCRIPT));
             switch (phase) {
                 case "game" -> {
                     if (!roleEnterSubmitted) {
@@ -1243,6 +1297,7 @@ public class AccountSession implements AutoCloseable {
                 case "role" -> {
                     traceLoginStage("选择角色界面");
                     officialLoginSubmitted = true;
+                    resetLoadingClickState();
                     pollAutoEnterRole(frame);
                     return "role";
                 }
@@ -1270,6 +1325,7 @@ public class AccountSession implements AutoCloseable {
                 default -> {
                     traceLoginStage("登录资源加载中");
                     dismissLoginAlert(frame);
+                    pollTianyuLoadingEnter(frame);
                     return "loading";
                 }
             }
@@ -1376,6 +1432,59 @@ public class AccountSession implements AutoCloseable {
         }
     }
 
+    private void pollTianyuLoadingEnter(Frame frame) {
+        if (config.getChannel() != Channel.TIANYU) {
+            return;
+        }
+        try {
+            if (!hasVisibleCanvas(frame)) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (loadingSceneFirstSeenAt == 0L) {
+                loadingSceneFirstSeenAt = now;
+                loadingActionAt = now;
+                return;
+            }
+
+            long sinceScene = now - loadingSceneFirstSeenAt;
+            long sinceClick = now - loadingActionAt;
+            boolean shouldClick = sinceScene >= 2_500L && sinceClick >= 1_500L;
+            if (!shouldClick) {
+                return;
+            }
+
+            String currentPhase = String.valueOf(frame.evaluate(LOGIN_PHASE_SCRIPT));
+            if (!"loading".equals(currentPhase)) {
+                return;
+            }
+            clickCanvasNormalized(frame, LOADING_ENTER_X, LOADING_ENTER_Y);
+            loadingClickCount++;
+            loadingActionAt = now;
+            traceLoginEvent(loadingClickCount == 1
+                    ? "画布点击加载页“进入游戏”按钮"
+                    : "仍在加载页，再次点击“进入游戏”按钮（第" + loadingClickCount + "次）");
+        } catch (Exception e) {
+            traceLoginEvent("加载页进入游戏点击暂未触发：" + e.getMessage());
+        }
+    }
+
+    private boolean hasVisibleCanvas(Frame frame) {
+        try {
+            Object result = frame.evaluate("""
+                    () => {
+                        const canvas = document.querySelector('canvas');
+                        if (!canvas || !canvas.getBoundingClientRect) return false;
+                        const r = canvas.getBoundingClientRect();
+                        return !!(r && r.width > 2 && r.height > 2);
+                    }
+                    """);
+            return Boolean.TRUE.equals(result);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void pollAutoEnterRole(Frame frame) {
         dismissLoginAlert(frame);
         try {
@@ -1386,9 +1495,9 @@ public class AccountSession implements AutoCloseable {
                     boolean entered = obj.has("entered") && obj.get("entered").getAsBoolean();
                     if (entered) {
                         roleObjectEnterRequested = true;
-                        traceLoginEvent("已通过游戏对象选择角色并请求进入游戏");
+                        traceLoginEvent("已通过游戏对象请求进入游戏");
                     } else if (obj.has("error") && !obj.get("error").isJsonNull()) {
-                        traceLoginEvent("游戏对象选角未触发，准备使用坐标兜底："
+                        traceLoginEvent("游戏对象进入未触发，准备使用坐标兜底："
                                 + obj.get("error").getAsString());
                     }
                 }
@@ -1397,25 +1506,26 @@ public class AccountSession implements AutoCloseable {
             long now = System.currentTimeMillis();
             if (roleSceneFirstSeenAt == 0L) {
                 roleSceneFirstSeenAt = now;
+                roleFallbackActionAt = now;
                 return;
             }
             long elapsed = now - roleSceneFirstSeenAt;
-            if (roleFallbackStep == 0 && elapsed >= 1_200L) {
-                clickCanvasNormalized(frame, ROLE_CARD_X, ROLE_CARD_Y);
+            if (roleFallbackStep == 0 && elapsed >= 600L) {
+                // 真正点击前再确认一次仍在选角页，避免页面已经切换后误点游戏内界面。
+                String currentPhase = String.valueOf(frame.evaluate(LOGIN_PHASE_SCRIPT));
+                if (!"role".equals(currentPhase)) {
+                    return;
+                }
+                clickCanvasNormalized(frame, ROLE_ENTER_X, ROLE_ENTER_Y);
                 roleFallbackStep = 1;
                 roleFallbackActionAt = now;
-                traceLoginEvent("画布兜底点击角色卡片");
-            } else if (roleFallbackStep == 1 && now - roleFallbackActionAt >= 600L) {
-                clickCanvasNormalized(frame, ROLE_ENTER_X, ROLE_ENTER_Y);
-                roleFallbackStep = 2;
-                roleFallbackActionAt = now;
-                traceLoginEvent("画布兜底点击进入游戏");
-            } else if (roleFallbackStep == 2 && elapsed >= 8_000L) {
-                traceLoginEvent("选角界面仍在，重新尝试选择角色");
+                traceLoginEvent("画布兜底点击选角页“进入游戏”按钮");
+            } else if (roleFallbackStep == 1 && elapsed >= 8_000L) {
+                traceLoginEvent("选角界面仍在，重新尝试进入游戏");
                 resetRoleFallbackState();
             }
         } catch (Exception e) {
-            traceLoginEvent("自动选角坐标兜底暂未触发：" + e.getMessage());
+            traceLoginEvent("选角页进入游戏坐标兜底暂未触发：" + e.getMessage());
         }
     }
 
@@ -1435,6 +1545,12 @@ public class AccountSession implements AutoCloseable {
         double safeX = Math.max(0.02D, Math.min(0.98D, nx));
         double safeY = Math.max(0.02D, Math.min(0.98D, ny));
         target.mouse().click(box.x + safeX * box.width, box.y + safeY * box.height);
+    }
+
+    private void resetLoadingClickState() {
+        loadingSceneFirstSeenAt = 0L;
+        loadingActionAt = 0L;
+        loadingClickCount = 0;
     }
 
     private void resetRoleFallbackState() {
