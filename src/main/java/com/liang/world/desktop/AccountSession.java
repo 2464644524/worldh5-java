@@ -7,6 +7,7 @@ import com.google.gson.JsonParser;
 import com.microsoft.playwright.CDPSession;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType;
+import com.microsoft.playwright.ElementHandle;
 import com.microsoft.playwright.Frame;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.ViewportSize;
@@ -55,6 +56,10 @@ public class AccountSession implements AutoCloseable {
     private String officialPassword = "";
     private boolean officialLoginSubmitted;
     private boolean roleEnterSubmitted;
+    private long roleSceneFirstSeenAt;
+    private long roleFallbackActionAt;
+    private int roleFallbackStep;
+    private boolean roleObjectEnterRequested;
     private boolean createRoleNotified;
     private boolean captchaNotified;
     private boolean loginTipNotified;
@@ -223,6 +228,10 @@ public class AccountSession implements AutoCloseable {
     private void resetOfficialAutomationState() {
         officialLoginSubmitted = false;
         roleEnterSubmitted = false;
+        roleSceneFirstSeenAt = 0L;
+        roleFallbackActionAt = 0L;
+        roleFallbackStep = 0;
+        roleObjectEnterRequested = false;
         createRoleNotified = false;
         captchaNotified = false;
         loginTipNotified = false;
@@ -285,7 +294,7 @@ public class AccountSession implements AutoCloseable {
         page = context.pages().isEmpty() ? context.newPage() : context.pages().get(0);
         activePage = page;
         popupNotified = false;
-        lastLoginTraceStage = "";
+        resetOfficialAutomationState();
         adoptedPages.clear();
         adoptedPages.add(page);
         // 游戏选角后可能 window.open 弹出真正的游戏标签页，统一接管 context 里所有页面。
@@ -352,12 +361,7 @@ public class AccountSession implements AutoCloseable {
     public synchronized void login() {
         ensureOpen();
         bootstrapped = false; scriptFlags = 0;
-        lastLoginTraceStage = "";
-        if (config.getChannel() == Channel.GUANFANG
-                && officialUsername != null && !officialUsername.isBlank()
-                && officialPassword != null && !officialPassword.isBlank()) {
-            resetOfficialAutomationState();
-        }
+        resetOfficialAutomationState();
         traceLoginEvent("进入渠道登录页：" + safeUrlForLog(config.getChannel().loginUrl()));
         page.navigate(config.getChannel().loginUrl());
         bringToFront();
@@ -367,6 +371,7 @@ public class AccountSession implements AutoCloseable {
     public synchronized void reload() {
         ensureOpen();
         bootstrapped = false; scriptFlags = 0;
+        resetOfficialAutomationState();
         page.reload();
         log("刷新 " + config.displayName());
     }
@@ -405,7 +410,11 @@ public class AccountSession implements AutoCloseable {
             return;
         }
         Frame frame = gameFrame.get();
-        pollOfficialAutomation(frame);
+        String loginPhase = pollLoginAutomation(frame);
+        if (!"game".equals(loginPhase)) {
+            // 登录面板/验证码/创建角色/选择角色期间绝不能提前注入加速和任务脚本。
+            return;
+        }
         try {
             Object ready = frame.evaluate(
                     "() => typeof xself !== 'undefined' && typeof Control !== 'undefined' "
@@ -1120,59 +1129,160 @@ public class AccountSession implements AutoCloseable {
 
 
 
-    private void pollOfficialAutomation(Frame frame) {
-        if (config.getChannel() != Channel.GUANFANG
-                || officialUsername == null || officialUsername.isBlank()
-                || officialPassword == null || officialPassword.isBlank()) {
-            return;
-        }
+    private static final String LOGIN_PHASE_SCRIPT = """
+            (() => {
+                try {
+                    if (typeof ImgCheckPanel !== 'undefined'
+                            && typeof PanelManager !== 'undefined'
+                            && PanelManager.isPanelShow
+                            && PanelManager.isPanelShow(ImgCheckPanel)) {
+                        return 'captcha';
+                    }
+                    if (typeof Login !== 'undefined' && Login.instance) {
+                        const login = Login.instance;
+                        const visibleScene = (scene) => !!scene && !!scene.stage
+                            && scene.visible !== false && !!scene.parent;
+                        if (visibleScene(login.createRoleScene)) return 'create-role';
+                        if (visibleScene(login.selectRoleScene)) return 'role';
+                    }
+                    if (typeof LoginPanel !== 'undefined' && typeof PanelManager !== 'undefined') {
+                        const panel = PanelManager.getPanel(LoginPanel);
+                        if (panel && panel.stage && panel.parent
+                                && panel.visible !== false) {
+                            return 'login';
+                        }
+                    }
+                    if (typeof xself !== 'undefined' && !!xself
+                            && typeof Control !== 'undefined'
+                            && typeof nato !== 'undefined') {
+                        return 'game';
+                    }
+                    return 'loading';
+                } catch (e) {
+                    return 'loading';
+                }
+            })()
+            """;
 
+    private static final String ROLE_ENTER_SCRIPT = """
+            (() => {
+                try {
+                    if (typeof Login === 'undefined' || !Login.instance) {
+                        return JSON.stringify({ stage: 'wait' });
+                    }
+                    const login = Login.instance;
+                    const visibleScene = (scene) => !!scene && !!scene.stage
+                        && scene.visible !== false && !!scene.parent;
+                    if (visibleScene(login.createRoleScene)) {
+                        return JSON.stringify({ stage: 'create-role' });
+                    }
+                    const scene = login.selectRoleScene;
+                    if (!visibleScene(scene)) {
+                        return JSON.stringify({ stage: 'wait' });
+                    }
+
+                    const players = login.allPlayerList || [];
+                    let player = players[0] || null;
+                    try {
+                        const normal = ModelConst && ModelConst.STATUS_NORMAL;
+                        if (normal !== undefined) {
+                            player = players.find(p => p
+                                && typeof p.getStatus === 'function'
+                                && p.getStatus() === normal) || player;
+                        }
+                    } catch (ignored) {}
+
+                    let entered = false;
+                    if (player) {
+                        scene.selectedPlayer = player;
+                        scene.updatePlayerInfo && scene.updatePlayerInfo();
+                        scene.onEnterGame && scene.onEnterGame(null);
+                        entered = true;
+                    }
+                    try {
+                        if (typeof AlertPanel !== 'undefined'
+                                && AlertPanel.instance && AlertPanel.instance.stage) {
+                            AlertPanel.instance.onBtnOkTouch
+                                && AlertPanel.instance.onBtnOkTouch();
+                        }
+                    } catch (ignored) {}
+                    return JSON.stringify({
+                        stage: 'role',
+                        players: players.length,
+                        entered: entered
+                    });
+                } catch (e) {
+                    return JSON.stringify({
+                        stage: 'role',
+                        entered: false,
+                        error: e && e.message ? String(e.message) : String(e)
+                    });
+                }
+            })()
+            """;
+
+    // 实测天宇直链进游戏：画布 (0.436,0.870) 选角色，(0.557,0.929) 点进入游戏。
+    private static final double ROLE_CARD_X = 0.436D;
+    private static final double ROLE_CARD_Y = 0.870D;
+    private static final double ROLE_ENTER_X = 0.557D;
+    private static final double ROLE_ENTER_Y = 0.929D;
+
+    private String pollLoginAutomation(Frame frame) {
         try {
-            if (!officialLoginSubmitted) {
-                String phaseScript = """
-                        (() => {
-                            try {
-                                if (typeof xself !== 'undefined' && typeof Control !== 'undefined'
-                                        && typeof nato !== 'undefined' && xself) {
-                                    return 'game';
-                                }
-                                const loginObject = typeof Login !== 'undefined' ? Login.instance : null;
-                                const roleScene = loginObject && loginObject.selectRoleScene;
-                                if (roleScene && roleScene.stage && roleScene.visible !== false) {
-                                    return 'role';
-                                }
-                                if (typeof LoginPanel !== 'undefined' && typeof PanelManager !== 'undefined') {
-                                    const panel = PanelManager.getPanel(LoginPanel);
-                                    if (panel && panel.stage && panel.parent && panel.visible !== false) {
-                                        return 'login';
-                                    }
-                                }
-                                return 'loading';
-                            } catch (e) {
-                                return 'loading';
-                            }
-                        })()
-                        """;
-                Object phase = frame.evaluate(phaseScript);
-                String phaseValue = String.valueOf(phase);
-                switch (phaseValue) {
-                    case "game" -> {
-                        traceLoginStage("官服游戏核心对象就绪");
-                        officialLoginSubmitted = true;
-                        roleEnterSubmitted = true;
-                        return;
+            String phase = String.valueOf(frame.evaluate(LOGIN_PHASE_SCRIPT));
+            switch (phase) {
+                case "game" -> {
+                    if (!roleEnterSubmitted) {
+                        traceLoginEvent("游戏核心对象已就绪，准备注入辅助环境");
                     }
-                    case "role" -> {
-                        traceLoginStage("官服选择角色界面");
-                        officialLoginSubmitted = true;
+                    officialLoginSubmitted = true;
+                    roleEnterSubmitted = true;
+                    resetRoleFallbackState();
+                    return "game";
+                }
+                case "role" -> {
+                    traceLoginStage("选择角色界面");
+                    officialLoginSubmitted = true;
+                    pollAutoEnterRole(frame);
+                    return "role";
+                }
+                case "create-role" -> {
+                    if (!createRoleNotified) {
+                        createRoleNotified = true;
+                        traceLoginEvent("账号尚未创建角色，请手动创建后继续");
                     }
-                    case "login" -> traceLoginStage("官服账号密码登录面板");
-                    default -> {
-                        traceLoginStage("官服登录资源加载中");
-                        return;
+                    return "create-role";
+                }
+                case "captcha" -> {
+                    if (!captchaNotified) {
+                        captchaNotified = true;
+                        traceLoginEvent("账号触发图形验证码，请在窗口中手动处理");
                     }
+                    return "captcha";
+                }
+                case "login" -> {
+                    traceLoginStage(hasOfficialCredentials()
+                            ? "官服账号密码登录面板"
+                            : "渠道账号密码登录面板");
+                    pollOfficialLogin(frame);
+                    return "login";
+                }
+                default -> {
+                    traceLoginStage("登录资源加载中");
+                    dismissLoginAlert(frame);
+                    return "loading";
                 }
             }
+        } catch (Exception e) {
+            return "loading";
+        }
+    }
+
+    private void pollOfficialLogin(Frame frame) {
+        if (!hasOfficialCredentials()) {
+            return;
+        }
+        try {
             if (!officialLoginSubmitted) {
                 String loginScript = """
                         (() => {
@@ -1217,155 +1327,122 @@ public class AccountSession implements AutoCloseable {
                 return;
             }
 
-            Object gameReady = frame.evaluate(
-                    "() => typeof xself !== 'undefined' && typeof Control !== 'undefined' "
-                            + "&& typeof nato !== 'undefined' && !!xself");
-            if (Boolean.TRUE.equals(gameReady)) {
-                roleEnterSubmitted = true;
-                return;
+            String tipScript = """
+                    (() => {
+                        try {
+                            if (typeof LoginPanel === 'undefined'
+                                    || typeof PanelManager === 'undefined') {
+                                return 'gone';
+                            }
+                            const panel = PanelManager.getPanel(LoginPanel);
+                            if (!panel || !panel.stage || !panel.parent
+                                    || panel.visible === false) {
+                                return 'gone';
+                            }
+                            const tip = panel.tips && panel.tips.text
+                                ? String(panel.tips.text) : '';
+                            return tip ? 'tip:' + tip : 'login';
+                        } catch (e) {
+                            return 'gone';
+                        }
+                    })()
+                    """;
+            String state = String.valueOf(frame.evaluate(tipScript));
+            if (state.startsWith("tip:")) {
+                if (!loginTipNotified) {
+                    loginTipNotified = true;
+                    traceLoginEvent("登录未成功：" + state.substring(4));
+                }
             }
+        } catch (Exception e) {
+            // 登录资源仍在加载，下一秒继续。
+        }
+    }
 
-            String alertScript = """
+    private void dismissLoginAlert(Frame frame) {
+        try {
+            frame.evaluate("""
                     (() => {
                         try {
                             if (typeof AlertPanel !== 'undefined'
                                     && AlertPanel.instance && AlertPanel.instance.stage) {
                                 AlertPanel.instance.onBtnOkTouch
                                     && AlertPanel.instance.onBtnOkTouch();
-                                return 'ok';
                             }
                         } catch (e) {}
-                        return 'none';
                     })()
-                    """;
-            frame.evaluate(alertScript);
-
-            if (!roleEnterSubmitted) {
-                String loginPanelScript = """
-                        (() => {
-                            try {
-                                if (typeof LoginPanel === 'undefined'
-                                        || typeof PanelManager === 'undefined') {
-                                    return 'gone';
-                                }
-                                const panel = PanelManager.getPanel(LoginPanel);
-                                if (!panel || !panel.stage || !panel.parent
-                                        || panel.visible === false) {
-                                    return 'gone';
-                                }
-                                let tip = '';
-                                try {
-                                    tip = panel.tips && panel.tips.text ? String(panel.tips.text) : '';
-                                } catch (ignored) {}
-                                return tip ? 'tip:' + tip : 'login';
-                            } catch (e) {
-                                return 'gone';
-                            }
-                        })()
-                        """;
-                String loginPanelState = String.valueOf(frame.evaluate(loginPanelScript));
-                if ("login".equals(loginPanelState)) {
-                    return;
-                }
-                if (loginPanelState.startsWith("tip:")) {
-                    if (!loginTipNotified) {
-                        loginTipNotified = true;
-                        traceLoginEvent("登录未成功：" + loginPanelState.substring(4));
-                    }
-                    return;
-                }
-
-                String captchaScript = """
-                        (() => {
-                            try {
-                                if (typeof ImgCheckPanel !== 'undefined'
-                                        && typeof PanelManager !== 'undefined'
-                                        && PanelManager.isPanelShow
-                                        && PanelManager.isPanelShow(ImgCheckPanel)) {
-                                    return 'captcha';
-                                }
-                                return 'ok';
-                            } catch (e) {
-                                return 'ok';
-                            }
-                        })()
-                        """;
-                if ("captcha".equals(String.valueOf(frame.evaluate(captchaScript)))) {
-                    if (!captchaNotified) {
-                        captchaNotified = true;
-                        traceLoginEvent("账号触发图形验证码，请在窗口中手动处理");
-                    }
-                    return;
-                }
-
-                String roleScript = """
-                        (() => {
-                            try {
-                                if (typeof Login === 'undefined' || !Login.instance) {
-                                    return 'wait';
-                                }
-                                const login = Login.instance;
-                                const createScene = login.createRoleScene;
-                                if (createScene && createScene.stage
-                                        && createScene.visible !== false) {
-                                    return 'create-role';
-                                }
-                                const scene = login.selectRoleScene;
-                                if (!scene || !scene.stage || scene.visible === false
-                                        || !scene.parent) {
-                                    return 'wait';
-                                }
-                                const players = login.allPlayerList || [];
-                                if (!players.length) {
-                                    return 'wait-players';
-                                }
-                                let player = players[0];
-                                try {
-                                    const normal = ModelConst && ModelConst.STATUS_NORMAL;
-                                    if (normal !== undefined) {
-                                        player = players.find(p => p
-                                            && typeof p.getStatus === 'function'
-                                            && p.getStatus() === normal) || player;
-                                    }
-                                } catch (ignored) {}
-                                scene.selectedPlayer = player;
-                                scene.updatePlayerInfo && scene.updatePlayerInfo();
-                                scene.onEnterGame && scene.onEnterGame(null);
-                                try {
-                                    if (typeof AlertPanel !== 'undefined'
-                                            && AlertPanel.instance && AlertPanel.instance.stage) {
-                                        AlertPanel.instance.onBtnOkTouch
-                                            && AlertPanel.instance.onBtnOkTouch();
-                                    }
-                                } catch (ignored) {}
-                                return 'entered';
-                            } catch (e) {
-                                return 'error:' + (e && e.message ? e.message : e);
-                            }
-                        })()
-                        """;
-                Object result = frame.evaluate(roleScript);
-                String value = String.valueOf(result);
-                if ("wait-players".equals(value)) {
-                    traceLoginStage("选择角色界面已出现，等待角色列表");
-                } else if ("entered".equals(value)) {
-                    roleEnterSubmitted = true;
-                    traceLoginEvent("已自动选择角色并请求进入游戏");
-                } else if ("create-role".equals(value)) {
-                    if (!createRoleNotified) {
-                        createRoleNotified = true;
-                        traceLoginEvent("账号尚未创建角色，请手动创建后继续");
-                    }
-                } else if (value.startsWith("error:")) {
-                    traceLoginEvent("自动选角暂未触发：" + value);
-                }
-            }
-        } catch (Exception e) {
-            // 游戏资源还在加载时，部分全局对象会短暂不可用，下一轮继续。
+                    """);
+        } catch (Exception ignored) {
         }
     }
 
+    private void pollAutoEnterRole(Frame frame) {
+        dismissLoginAlert(frame);
+        try {
+            if (!roleObjectEnterRequested) {
+                Object result = frame.evaluate(ROLE_ENTER_SCRIPT);
+                if (result instanceof String json && !json.isBlank()) {
+                    JsonObject obj = JsonParser.parseString(json).getAsJsonObject();
+                    boolean entered = obj.has("entered") && obj.get("entered").getAsBoolean();
+                    if (entered) {
+                        roleObjectEnterRequested = true;
+                        traceLoginEvent("已通过游戏对象选择角色并请求进入游戏");
+                    } else if (obj.has("error") && !obj.get("error").isJsonNull()) {
+                        traceLoginEvent("游戏对象选角未触发，准备使用坐标兜底："
+                                + obj.get("error").getAsString());
+                    }
+                }
+            }
 
+            long now = System.currentTimeMillis();
+            if (roleSceneFirstSeenAt == 0L) {
+                roleSceneFirstSeenAt = now;
+                return;
+            }
+            long elapsed = now - roleSceneFirstSeenAt;
+            if (roleFallbackStep == 0 && elapsed >= 1_200L) {
+                clickCanvasNormalized(frame, ROLE_CARD_X, ROLE_CARD_Y);
+                roleFallbackStep = 1;
+                roleFallbackActionAt = now;
+                traceLoginEvent("画布兜底点击角色卡片");
+            } else if (roleFallbackStep == 1 && now - roleFallbackActionAt >= 600L) {
+                clickCanvasNormalized(frame, ROLE_ENTER_X, ROLE_ENTER_Y);
+                roleFallbackStep = 2;
+                roleFallbackActionAt = now;
+                traceLoginEvent("画布兜底点击进入游戏");
+            } else if (roleFallbackStep == 2 && elapsed >= 8_000L) {
+                traceLoginEvent("选角界面仍在，重新尝试选择角色");
+                resetRoleFallbackState();
+            }
+        } catch (Exception e) {
+            traceLoginEvent("自动选角坐标兜底暂未触发：" + e.getMessage());
+        }
+    }
+
+    private void clickCanvasNormalized(Frame frame, double nx, double ny) {
+        ElementHandle canvas = frame.querySelector("canvas");
+        if (canvas == null) {
+            throw new IllegalStateException("暂未找到游戏画布");
+        }
+        com.microsoft.playwright.options.BoundingBox box = canvas.boundingBox();
+        if (box == null || box.width <= 1 || box.height <= 1) {
+            throw new IllegalStateException("游戏画布尺寸无效");
+        }
+        Page target = frame.page();
+        if (target == null || target.isClosed()) {
+            throw new IllegalStateException("游戏页面已关闭");
+        }
+        double safeX = Math.max(0.02D, Math.min(0.98D, nx));
+        double safeY = Math.max(0.02D, Math.min(0.98D, ny));
+        target.mouse().click(box.x + safeX * box.width, box.y + safeY * box.height);
+    }
+
+    private void resetRoleFallbackState() {
+        roleSceneFirstSeenAt = 0L;
+        roleFallbackActionAt = 0L;
+        roleFallbackStep = 0;
+        roleObjectEnterRequested = false;
+    }
 
     private List<Page> activePages() {
         List<Page> result = new ArrayList<>();

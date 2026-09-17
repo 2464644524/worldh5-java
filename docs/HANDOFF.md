@@ -411,3 +411,36 @@ hook 只在注入后的游戏帧生效，需重开窗口。
 - 官服自动登录阶段增加状态变化日志：资源加载、账号密码面板、提交动作、验证码、选角、角色列表、请求进入游戏。
 
 验证：`mvn -q clean compile` 与 `node --check login_trace.js` 通过。新增日志只对新打开窗口生效，需完全关闭控制台和 Edge 后重启。
+---
+
+## 15. 通用自动选角与进入游戏（2026-09-17 23:15 CST）
+
+用户复盘的天宇直链进游戏步骤：
+
+1. 打开 Excel/存号里的天宇游戏直链（无账号密码页、无验证码）。
+2. 约 3 秒后到选择角色界面。
+3. 人工第一次点击 Canvas 归一化坐标 `(0.436, 0.870)`，用于选择角色卡片。
+4. 约 1 秒后点击 Canvas 归一化坐标 `(0.557, 0.929)`，用于点击“进入游戏”。
+5. 随后 `xself / Control / nato` 就绪，脚本才允许注入。
+
+实现：
+
+- `AccountSession.pollLoginAutomation(Frame)` 取代旧的“仅官服”登录轮询，对天宇、官服、小七统一识别：
+  `loading / login / captcha / role / create-role / game`。
+- 官服仍只在有账号密码时自动填写并调用 `LoginPanel.login()`；无密码渠道不会写入任何输入框。
+- 选角阶段优先走游戏对象：
+  - 读取 `Login.instance.selectRoleScene`；
+  - 从 `Login.instance.allPlayerList` 找 `ModelConst.STATUS_NORMAL`，找不到则用第一个角色；
+  - 设置 `selectedPlayer`、刷新角色信息并调用 `scene.onEnterGame(null)`；
+  - 自动确认可能弹出的 `AlertPanel`。
+- 增加坐标兜底：选角界面持续约 1.2 秒仍未进入时，通过 Playwright 在 Canvas 实际包围盒上点击 `(0.436,0.870)`；下一轮再点击 `(0.557,0.929)`。若 8 秒后仍停留在选角界面，会重新走对象接口和坐标兜底。
+- `pollBootstrap()` 只有在阶段为 `game` 且 `xself / Control / nato` 就绪后才调用 `injectBootstrap()`；登录、验证码、创建角色、选角期间一律不提前注入加速/任务脚本，避免窗口 2、刷新后或天宇渠道出现加速和任务日志失效。
+- 控制台继续输出 `[登录]`，关键日志包括“选择角色界面”“已通过游戏对象选择角色并请求进入游戏”“画布兜底点击角色卡片”“画布兜底点击进入游戏”“游戏核心对象已就绪，准备注入辅助环境”。
+
+验证：
+
+```powershell
+.\tools\apache-maven-3.9.11\bin\mvn.cmd -q clean compile
+```
+
+通过。改完后必须完全关闭控制台和所有 Edge 游戏窗口，再双击 `run.cmd` 才会加载新逻辑。
