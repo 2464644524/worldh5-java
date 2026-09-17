@@ -492,6 +492,31 @@ public class AccountSession implements AutoCloseable {
         log("脚本已停止 " + config.displayName());
     }
 
+    // 托管停止时可能正处在登录页/加载页，不能因为找不到游戏帧而打断状态机收尾。
+    public synchronized void stopScriptsIfInGame(boolean activateWindow) {
+        if (!isOpen()) {
+            scriptFlags = 0;
+            return;
+        }
+        Optional<Frame> gameFrame = locateGameFrame(true);
+        if (gameFrame.isEmpty()) {
+            scriptFlags = 0;
+            return;
+        }
+        try {
+            evalGlobal(gameFrame.get(), """
+                    try { TestAutoGame.stop(); } catch (e) {}
+                    try { TestRefreshGame.stop(); } catch (e) {}
+                    try { TestLoopGame.stop(); } catch (e) {}
+                    """);
+            if (activateWindow) {
+                bringToFront();
+            }
+        } catch (Exception ignored) {
+        }
+        scriptFlags = 0;
+    }
+
     public int scriptFlags() {
         return scriptFlags;
     }
@@ -560,6 +585,61 @@ public class AccountSession implements AutoCloseable {
 
     public synchronized void enterCity() {
         enterCity(true);
+    }
+
+    public synchronized boolean isInCity() {
+        if (!isOpen()) {
+            return false;
+        }
+        Optional<Frame> gameFrame = locateGameFrame(true);
+        if (gameFrame.isEmpty()) {
+            return false;
+        }
+        Object result = gameFrame.get().evaluate("""
+                () => {
+                    try {
+                        return typeof xworld !== 'undefined' && !!xworld
+                                && typeof xworld.isInCityNow === 'function'
+                                && !!xworld.isInCityNow();
+                    } catch (e) {
+                        return false;
+                    }
+                }
+                """);
+        return Boolean.TRUE.equals(result);
+    }
+
+    public synchronized boolean enterCityIfNeeded(boolean activateWindow) {
+        ensureOpen();
+        Optional<Frame> gameFrame = locateGameFrame(true);
+        if (gameFrame.isEmpty()) {
+            throw new IllegalStateException("还没进入游戏，无法进城: " + config.displayName());
+        }
+        Object result = gameFrame.get().evaluate("""
+                () => {
+                    try {
+                        const alreadyInCity = typeof xworld !== 'undefined' && !!xworld
+                                && typeof xworld.isInCityNow === 'function'
+                                && !!xworld.isInCityNow();
+                        if (alreadyInCity) return true;
+                        City.doEnterCity(xself.getId());
+                        return false;
+                    } catch (e) {
+                        return null;
+                    }
+                }
+                """);
+        if (result == null) {
+            throw new IllegalStateException("进城接口暂未就绪: " + config.displayName());
+        }
+        boolean alreadyInCity = Boolean.TRUE.equals(result);
+        if (activateWindow) {
+            bringToFront();
+        }
+        if (!alreadyInCity) {
+            log("已执行进城 " + config.displayName());
+        }
+        return alreadyInCity;
     }
 
     public synchronized void enterCity(boolean activateWindow) {

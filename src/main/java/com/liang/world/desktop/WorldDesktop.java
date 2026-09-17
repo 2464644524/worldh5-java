@@ -57,6 +57,7 @@ public class WorldDesktop extends JFrame {
     private final SessionManager manager;
     private final JButton[] accountButtons = new JButton[ConfigStore.ACCOUNT_COUNT];
     private JButton syncButton;
+    private JButton pilotButton;
     private JButton autoButton;
     private JButton refreshButton;
     private JButton loopButton;
@@ -125,6 +126,10 @@ public class WorldDesktop extends JFrame {
     private JPanel buildActionPanel() {
         JPanel panel = new JPanel(new GridLayout(0, 2, 2, 2));
         panel.setBorder(BorderFactory.createTitledBorder("当前账号"));
+        pilotButton = actionButton("托管", "单号一键托管：等待进游戏、注入、进城并开启自动；再点一次停止（保留窗口）", this::toggleAutoPilot);
+        pilotButton.setOpaque(true);
+        pilotButton.setBorderPainted(true);
+        panel.add(pilotButton);
         panel.add(actionButton("打开", "打开当前选中账号", () -> manager.openAccount(selectedIndex)));
         panel.add(actionButton("登录", "进入当前账号的渠道登录页", () -> manager.login(selectedIndex)));
         panel.add(actionButton("刷新", "刷新当前游戏窗口", () -> manager.reload(selectedIndex)));
@@ -218,11 +223,6 @@ public class WorldDesktop extends JFrame {
             boolean nowOn = !manager.isSyncEnabled();
             manager.setSyncEnabled(nowOn, selectedIndex);
             refreshSyncButton();
-
-        boolean bootstrapped = manager.isAccountBootstrapped(selectedIndex);
-        paintToggle(autoButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_AUTO), bootstrapped);
-        paintToggle(refreshButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_REFRESH), bootstrapped);
-        paintToggle(loopButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_LOOP), bootstrapped);
         });
         return syncButton;
     }
@@ -268,11 +268,53 @@ public class WorldDesktop extends JFrame {
 
         refreshSyncButton();
 
+        boolean bootstrapped = manager.isAccountBootstrapped(selectedIndex);
+        paintToggle(autoButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_AUTO), bootstrapped);
+        paintToggle(refreshButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_REFRESH), bootstrapped);
+        paintToggle(loopButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_LOOP), bootstrapped);
+        refreshAutoPilotButton();
+
         AccountConfig config = manager.store().account(selectedIndex);
-        String state = manager.isAccountBootstrapped(selectedIndex) ? "已注入"
+        String state = bootstrapped ? "已注入"
                 : manager.isAccountOpen(selectedIndex) ? "已打开" : "未打开";
-        currentLabel.setText(String.format("%02d %s · %s",
-                selectedIndex + 1, config.getTitle(), state));
+        String base = String.format("%02d %s · %s",
+                selectedIndex + 1, config.getTitle(), state);
+        boolean pilotOnThis = manager.isAutoPilotActive()
+                && manager.getAutoPilotIndex() == selectedIndex;
+        if (pilotOnThis) {
+            String pilotStatus = manager.getAutoPilotStatus();
+            pilotStatus = pilotStatus.length() > 13 ? pilotStatus.substring(0, 13) : pilotStatus;
+            currentLabel.setText("<html><font size=1><center>"
+                    + base + "<br>[托管] " + pilotStatus + "</center></font></html>");
+        } else {
+            currentLabel.setText(base);
+        }
+    }
+
+    private void refreshAutoPilotButton() {
+        if (pilotButton == null) {
+            return;
+        }
+        boolean active = manager.isAutoPilotActive();
+        if (active) {
+            pilotButton.setText("停管·" + String.format("%02d", manager.getAutoPilotIndex() + 1));
+            pilotButton.setBackground(new Color(255, 153, 0));
+            pilotButton.setToolTipText("一键托管中。当前阶段：" + manager.getAutoPilotStatus()
+                    + "；点击停止并保留窗口。");
+        } else {
+            pilotButton.setText("托管");
+            pilotButton.setBackground(COLOR_CLOSED);
+            pilotButton.setToolTipText("单号一键托管：等待进游戏、注入、进城并开启自动；再点一次停止（保留窗口）");
+        }
+    }
+
+    private void toggleAutoPilot() {
+        if (manager.isAutoPilotActive()) {
+            manager.stopAutoPilot();
+        } else {
+            manager.startAutoPilot(selectedIndex);
+        }
+        refreshAccountButtons();
     }
 
     private void saveSelectedUrl() {

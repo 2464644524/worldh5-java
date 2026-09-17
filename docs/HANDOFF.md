@@ -371,3 +371,25 @@ hook 只在注入后的游戏帧生效，需重开窗口。
 5. 实施顺序：先做“单号一键托管”（登录等待→注入→进城→自动→状态显示/停止），再做任务监控与 A/B 完成判定，最后接入 Excel 队列自动切号；不要一开始直接做 10 开并发。
 
 待用户提供：完整任务链末端的目标任务名称/截图/日志；拿到前可先开发状态机、任务快照、计时和队列框架，A 命中逻辑预留配置字段。
+
+---
+
+## 13. 单号一键托管状态机（2026-09-17 22:24:14 CST）
+
+第一阶段只做单号闭环，**不做自动切号/关窗**，避免登录、进城、任务完成判定混在一起难以排查。
+
+入口：右侧“当前账号”区新增 **托管 / 停管·XX** 按钮。点击“托管”后对当前选中账号执行：
+
+1. 若窗口未打开则自动打开；已打开则复用当前窗口。
+2. 等待官服自动登录/选角，或天宇 URL 加载进入游戏。
+3. 等待既有 `pollBootstrap()` 定位游戏 Frame、确认 `xself/Control/nato` 并完成脚本注入。
+4. 注入后调用 `AccountSession.enterCityIfNeeded(false)`：先用 `xworld.isInCityNow()` 判断，未进城才执行 `City.doEnterCity(xself.getId())`，避免重复进城。
+5. 启动 `TestAutoGame.start()`，通过稳态轮询读取真实 `_isStarting` 位确认自动任务运行。
+6. 持续守护：若自动状态丢失，间隔重试最多 3 次；窗口关闭、登录超时、注入丢失、进城/启动超时都会输出明确失败阶段。
+7. 点击“停管”会尽量停止自动/刷怪/跟随（登录页找不到游戏帧也不会报错），**保留 Edge 窗口**。
+
+实现要点：
+- `SessionManager` 新增 `PILOT_*` 阶段、`startAutoPilot/stopAutoPilot/pollAutoPilot`；所有 Playwright 操作仍在单线程 `playwright-worker`，每秒 `pollAllSafely()` 末尾推进一次状态机，不使用阻塞 sleep。
+- `AccountSession` 新增 `isInCity()`、`enterCityIfNeeded(boolean)`、`stopScriptsIfInGame(boolean)`。
+- UI 顶部当前账号行会显示托管阶段和已运行时长；按钮运行中变橙色并显示“停管·槽位”。
+- 登录/选角等待超时 10 分钟；进城超时 60 秒；自动启动确认 30 秒。后续 A/B 判定和自动切号在此状态机上继续扩展。

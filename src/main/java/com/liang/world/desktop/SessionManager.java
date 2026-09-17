@@ -45,6 +45,35 @@ public class SessionManager implements AutoCloseable {
     private final java.util.concurrent.atomic.AtomicReference<String> latestSyncMove =
             new java.util.concurrent.atomic.AtomicReference<>();
 
+    // 单号一键托管：只负责“等待进游戏 → 注入 → 进城 → 开自动 → 持续守护/停止”。
+    // A/B 完成判定和自动切号在后续模块接入，本阶段不自动关闭窗口。
+    private static final int PILOT_IDLE = 0;
+    private static final int PILOT_OPENING = 1;
+    private static final int PILOT_WAIT_GAME = 2;
+    private static final int PILOT_ENTER_CITY = 3;
+    private static final int PILOT_START_AUTO = 4;
+    private static final int PILOT_RUNNING = 5;
+    private static final int PILOT_STOPPING = 6;
+    private static final int PILOT_FAILED = 7;
+
+    private static final long PILOT_OPEN_TIMEOUT_MS = 90_000L;
+    private static final long PILOT_LOGIN_TIMEOUT_MS = 10 * 60_000L;
+    private static final long PILOT_CITY_TIMEOUT_MS = 60_000L;
+    private static final long PILOT_AUTO_TIMEOUT_MS = 30_000L;
+
+    private volatile int autoPilotIndex = -1;
+    private volatile String autoPilotStatus = "";
+    private volatile boolean autoPilotActive;
+    private volatile boolean autoPilotStopRequested;
+    private int autoPilotPhase = PILOT_IDLE;
+    private long autoPilotStartedAt;
+    private long autoPilotPhaseAt;
+    private long autoPilotNextActionAt;
+    private int autoPilotAttempts;
+    private int autoPilotRestartCount;
+    private boolean autoPilotCityRequested;
+    private long autoPilotLastRestartAt;
+
     public SessionManager(Path dataDir, Rectangle gameBounds, Consumer<String> logger) {
         this.dataDir = dataDir;
         this.store = new ConfigStore(dataDir);
@@ -601,6 +630,278 @@ public class SessionManager implements AutoCloseable {
         submit("领取微端奖励失败", () -> sessions[index].drawMicroReward());
     }
 
+    public boolean isAutoPilotActive() {
+        return autoPilotActive;
+    }
+
+    public int getAutoPilotIndex() {
+        return autoPilotIndex;
+    }
+
+    public String getAutoPilotStatus() {
+        return autoPilotStatus == null ? "" : autoPilotStatus;
+    }
+
+    public void startAutoPilot(int index) {
+        submit("启动一键托管失败", () -> {
+            if (autoPilotActive) {
+                log("一键托管正在运行：" + pilotDisplayName());
+                return;
+            }
+            int safeIndex = Math.max(0, Math.min(index, sessions.length - 1));
+            AccountSession session = sessions[safeIndex];
+            if (session == null) {
+                log("一键托管启动失败：账号槽位未初始化");
+                return;
+            }
+
+            long now = System.currentTimeMillis();
+            autoPilotIndex = safeIndex;
+            autoPilotStopRequested = false;
+            autoPilotActive = true;
+            autoPilotStartedAt = now;
+            autoPilotPhaseAt = now;
+            autoPilotNextActionAt = now;
+            autoPilotAttempts = 0;
+            autoPilotRestartCount = 0;
+            autoPilotCityRequested = false;
+            autoPilotPhase = PILOT_OPENING;
+            setAutoPilotStatus("正在打开浏览器");
+            log("[托管] 开始处理 " + store.account(safeIndex).displayName());
+
+            try {
+                session.open(playwright);
+                refreshState(safeIndex);
+                autoPilotPhase = PILOT_WAIT_GAME;
+                autoPilotPhaseAt = System.currentTimeMillis();
+                autoPilotNextActionAt = autoPilotPhaseAt;
+                setAutoPilotStatus("等待登录、选角并进入游戏");
+            } catch (Exception e) {
+                failAutoPilot("打开浏览器失败: " + e.getMessage());
+            }
+        });
+    }
+
+    public void stopAutoPilot() {
+        submit("停止一键托管失败", () -> {
+            if (!autoPilotActive || autoPilotIndex < 0) {
+                autoPilotActive = false;
+                autoPilotStopRequested = false;
+                autoPilotPhase = PILOT_IDLE;
+                setAutoPilotStatus("");
+                return;
+            }
+            int index = autoPilotIndex;
+            autoPilotStopRequested = true;
+            autoPilotPhase = PILOT_STOPPING;
+            setAutoPilotStatus("正在停止脚本");
+            AccountSession session = sessions[index];
+            if (session != null) {
+                try {
+                    session.stopScriptsIfInGame(false);
+                } catch (Exception ignored) {
+                }
+            }
+            autoPilotActive = false;
+            autoPilotStopRequested = false;
+            autoPilotPhase = PILOT_IDLE;
+            setAutoPilotStatus("已停止（窗口保留）");
+            log("[托管] 已停止 " + store.account(index).displayName() + "，窗口保留");
+        });
+    }
+
+    private void pollAutoPilot() {
+        if (!autoPilotActive || autoPilotStopRequested) {
+            return;
+        }
+        int index = autoPilotIndex;
+        if (index < 0 || index >= sessions.length || sessions[index] == null) {
+            failAutoPilot("托管账号槽位无效");
+            return;
+        }
+
+        AccountSession session = sessions[index];
+        long now = System.currentTimeMillis();
+        try {
+            switch (autoPilotPhase) {
+                case PILOT_OPENING -> setAutoPilotStatus("正在打开浏览器");
+
+                case PILOT_WAIT_GAME -> {
+                    if (!session.isOpen()) {
+                        failAutoPilot("浏览器窗口已关闭");
+                        return;
+                    }
+                    if (session.isBootstrapped()) {
+                        log("[托管] 游戏环境已就绪 " + pilotDisplayName());
+                        autoPilotPhase = PILOT_ENTER_CITY;
+                        autoPilotPhaseAt = now;
+                        autoPilotNextActionAt = now;
+                        autoPilotAttempts = 0;
+                        autoPilotCityRequested = false;
+                        setAutoPilotStatus("准备进城");
+                    } else if (now - autoPilotStartedAt > PILOT_LOGIN_TIMEOUT_MS) {
+                        failAutoPilot("等待登录/选角/进入游戏超时，请检查账号密码、验证码或网络");
+                    } else {
+                        setAutoPilotStatus("等待登录/选角/进入游戏（"
+                                + elapsedText(now - autoPilotStartedAt) + "）");
+                    }
+                }
+
+                case PILOT_ENTER_CITY -> {
+                    if (!session.isOpen()) {
+                        failAutoPilot("浏览器窗口已关闭");
+                        return;
+                    }
+                    if (!session.isBootstrapped()) {
+                        if (now - autoPilotPhaseAt > 60_000L) {
+                            failAutoPilot("游戏脚本注入失败或页面跳转异常");
+                        } else {
+                            setAutoPilotStatus("等待脚本注入完成");
+                        }
+                        return;
+                    }
+
+                    boolean inCity = false;
+                    try {
+                        inCity = session.isInCity();
+                    } catch (Exception ignored) {
+                    }
+                    if (inCity) {
+                        log("[托管] 已在城内 " + pilotDisplayName());
+                        autoPilotPhase = PILOT_START_AUTO;
+                        autoPilotPhaseAt = now;
+                        autoPilotNextActionAt = now;
+                        autoPilotAttempts = 0;
+                        setAutoPilotStatus("准备开启自动任务");
+                        return;
+                    }
+
+                    if (!autoPilotCityRequested) {
+                        try {
+                            session.enterCity(false);
+                            autoPilotCityRequested = true;
+                            autoPilotNextActionAt = now + 3_000L;
+                            setAutoPilotStatus("已请求进城，等待加载");
+                        } catch (Exception e) {
+                            autoPilotAttempts++;
+                            autoPilotNextActionAt = now + 3_000L;
+                            if (now - autoPilotPhaseAt > PILOT_CITY_TIMEOUT_MS) {
+                                failAutoPilot("进城失败: " + e.getMessage());
+                            } else {
+                                setAutoPilotStatus("进城接口未就绪，重试中（" + autoPilotAttempts + "）");
+                            }
+                        }
+                        return;
+                    }
+
+                    if (now - autoPilotPhaseAt > PILOT_CITY_TIMEOUT_MS) {
+                        failAutoPilot("进城超时，请确认角色状态或网络");
+                    } else {
+                        setAutoPilotStatus("等待进城加载（"
+                                + elapsedText(now - autoPilotPhaseAt) + "）");
+                    }
+                }
+
+                case PILOT_START_AUTO, PILOT_RUNNING -> {
+                    if (!session.isOpen()) {
+                        failAutoPilot("浏览器窗口已关闭");
+                        return;
+                    }
+                    if (!session.isBootstrapped()) {
+                        if (now - autoPilotPhaseAt > 60_000L) {
+                            failAutoPilot("游戏脚本注入丢失，自动任务无法继续");
+                        } else {
+                            setAutoPilotStatus("等待页面重新注入脚本");
+                        }
+                        return;
+                    }
+
+                    boolean autoOn = (session.scriptFlags() & AccountSession.FLAG_AUTO) != 0;
+                    if (autoPilotPhase == PILOT_START_AUTO) {
+                        if (now >= autoPilotNextActionAt && !autoOn) {
+                            try {
+                                session.startAuto(false);
+                                autoPilotAttempts++;
+                                log("[托管] 已发送自动任务启动指令 " + pilotDisplayName());
+                            } catch (Exception e) {
+                                if (now - autoPilotPhaseAt > PILOT_AUTO_TIMEOUT_MS) {
+                                    failAutoPilot("开启自动任务失败: " + e.getMessage());
+                                    return;
+                                }
+                            }
+                            autoPilotNextActionAt = now + 3_000L;
+                        }
+
+                        if (autoOn) {
+                            autoPilotPhase = PILOT_RUNNING;
+                            autoPilotPhaseAt = now;
+                            autoPilotNextActionAt = now + 10_000L;
+                            autoPilotRestartCount = 0;
+                            log("[托管] 自动任务已开启，进入持续守护 " + pilotDisplayName());
+                        } else if (now - autoPilotPhaseAt > PILOT_AUTO_TIMEOUT_MS) {
+                            failAutoPilot("自动任务开启后未检测到运行状态");
+                        } else {
+                            setAutoPilotStatus("确认自动任务状态（"
+                                    + elapsedText(now - autoPilotPhaseAt) + "）");
+                        }
+                        return;
+                    }
+
+                    if (autoOn) {
+                        autoPilotRestartCount = 0;
+                        autoPilotNextActionAt = now + 10_000L;
+                        setAutoPilotStatus("自动任务运行中（已托管 "
+                                + elapsedText(now - autoPilotStartedAt) + "）");
+                    } else if (now < autoPilotNextActionAt) {
+                        setAutoPilotStatus("自动任务状态确认中");
+                    } else if (autoPilotRestartCount >= 3) {
+                        failAutoPilot("自动任务连续停止，守护失败");
+                    } else {
+                        autoPilotRestartCount++;
+                        log("[托管] 检测到自动任务停止，第 "
+                                + autoPilotRestartCount + " 次重新开启 " + pilotDisplayName());
+                        session.startAuto(false);
+                        autoPilotNextActionAt = now + 10_000L;
+                        setAutoPilotStatus("自动任务断开，正在重启（"
+                                + autoPilotRestartCount + "/3）");
+                    }
+                }
+
+                case PILOT_STOPPING -> setAutoPilotStatus("正在停止脚本");
+                case PILOT_FAILED -> { }
+                default -> {
+                    autoPilotActive = false;
+                    autoPilotPhase = PILOT_IDLE;
+                }
+            }
+        } catch (Exception e) {
+            failAutoPilot("托管异常: " + e.getMessage());
+        }
+    }
+    private void failAutoPilot(String reason) {
+        String name = pilotDisplayName();
+        autoPilotActive = false;
+        autoPilotStopRequested = false;
+        autoPilotPhase = PILOT_FAILED;
+        setAutoPilotStatus("失败：" + reason);
+        log("[托管] " + name + " 失败: " + reason);
+    }
+
+    private String pilotDisplayName() {
+        if (autoPilotIndex < 0 || autoPilotIndex >= sessions.length) {
+            return "未知账号";
+        }
+        return store.account(autoPilotIndex).displayName();
+    }
+
+    private void setAutoPilotStatus(String status) {
+        autoPilotStatus = status == null ? "" : status;
+    }
+
+    private static String elapsedText(long ms) {
+        long totalSeconds = Math.max(0, ms / 1000L);
+        return String.format("%02d:%02d", totalSeconds / 60L, totalSeconds % 60L);
+    }
     public void saveCurrentUrl(int index, Path excelFile, Consumer<String> callback) {
         submit("存号失败", () -> {
             AccountConfig config = store.account(index);
@@ -750,6 +1051,7 @@ public class SessionManager implements AutoCloseable {
                 log("注入轮询异常: " + e.getMessage());
             }
         }
+        pollAutoPilot();
     }
 
     private void refreshAllStates() {
