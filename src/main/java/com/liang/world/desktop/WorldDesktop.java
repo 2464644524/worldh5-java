@@ -160,6 +160,8 @@ public class WorldDesktop extends JFrame {
         panel.add(actionButton("比例", "调整游戏区和辅助栏的宽度比例", this::editRatio));
         panel.add(actionButton("尺寸", "调整 Edge 手机仿真宽×高", this::editSize));
         panel.add(actionButton("缩放", "缩小/放大游戏内画面比例（不受窗口最小宽度限制）", this::editGameScale));
+        panel.add(actionButton("全托", "从导号队列第一个账号开始：自动登录、进城、自动任务，无主线后自动切到下一个账号",
+                this::startBulkAutoPilot));
         panel.add(actionButton("全前置", "恢复所有窗口尺寸并前置当前账号",
                 () -> manager.bringAllToFront(selectedIndex)));
         panel.add(actionButton("全自动", "对所有已进入游戏的账号开启自动",
@@ -297,7 +299,10 @@ public class WorldDesktop extends JFrame {
         }
         boolean active = manager.isAutoPilotActive();
         if (active) {
-            pilotButton.setText("停管·" + String.format("%02d", manager.getAutoPilotIndex() + 1));
+            int queueSize = manager.getAutoPilotQueueSize();
+            int queuePosition = manager.getAutoPilotQueuePosition();
+            String queueText = queueSize > 1 ? " " + queuePosition + "/" + queueSize : "";
+            pilotButton.setText("停管" + queueText + "·" + String.format("%02d", manager.getAutoPilotIndex() + 1));
             pilotButton.setBackground(new Color(255, 153, 0));
             pilotButton.setToolTipText("一键托管中。当前阶段：" + manager.getAutoPilotStatus()
                     + "；点击停止并保留窗口。");
@@ -315,6 +320,22 @@ public class WorldDesktop extends JFrame {
             manager.startAutoPilot(selectedIndex);
         }
         refreshAccountButtons();
+    }
+
+    private void startBulkAutoPilot() {
+        if (manager.isAutoPilotActive()) {
+            appendLog("托管队列已在运行，当前：" + manager.getAutoPilotStatus());
+            return;
+        }
+        int choice = JOptionPane.showConfirmDialog(
+                this,
+                "将从本次导号队列的第一个账号开始自动托管；当前号连续约60分钟无主线任务后，自动切到下一个账号。是否继续？",
+                "批量托管确认",
+                JOptionPane.OK_CANCEL_OPTION);
+        if (choice == JOptionPane.OK_OPTION) {
+            manager.startAutoPilotAll();
+            appendLog("开始批量托管导号队列");
+        }
     }
 
     private void saveSelectedUrl() {

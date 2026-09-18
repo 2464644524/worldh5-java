@@ -656,7 +656,50 @@ public class SessionManager implements AutoCloseable {
         return autoPilotStatus == null ? "" : autoPilotStatus;
     }
 
+    public int getAutoPilotQueuePosition() {
+        return pilotQueue.isEmpty() ? 0 : pilotQueuePosition + 1;
+    }
+
+    public int getAutoPilotQueueSize() {
+        return pilotQueue.size();
+    }
+
+    public void startAutoPilotAll() {
+        submit("启动批量托管失败", () -> {
+            if (autoPilotActive) {
+                log("一键托管正在运行：" + pilotDisplayName());
+                return;
+            }
+
+            int first = -1;
+            if (!lastLaunchedSlots.isEmpty()) {
+                for (Integer slot : lastLaunchedSlots) {
+                    if (slot != null && slot >= 0 && slot < sessions.length) {
+                        first = slot;
+                        break;
+                    }
+                }
+            }
+            if (first < 0) {
+                for (int i = 0; i < sessions.length; i++) {
+                    if (hasPilotLoginConfig(i)) {
+                        first = i;
+                        break;
+                    }
+                }
+            }
+            if (first < 0) {
+                first = Math.max(0, Math.min(0, sessions.length - 1));
+            }
+            beginAutoPilot(first);
+        });
+    }
+
     public void startAutoPilot(int index) {
+        submit("启动一键托管失败", () -> beginAutoPilot(index));
+    }
+
+    private void beginAutoPilot(int index) {
         submit("启动一键托管失败", () -> {
             if (autoPilotActive) {
                 log("一键托管正在运行：" + pilotDisplayName());
@@ -688,6 +731,9 @@ public class SessionManager implements AutoCloseable {
             setAutoPilotStatus("正在打开浏览器");
             log("[托管] 开始处理 " + store.account(safeIndex).displayName());
             log("[托管] 自动切号队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
+            if (pilotQueue.size() > 1) {
+                setAutoPilotStatus("等待处理队列 1/" + pilotQueue.size());
+            }
 
             try {
                 session.open(playwright);
