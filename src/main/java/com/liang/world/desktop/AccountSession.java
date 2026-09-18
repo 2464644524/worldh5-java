@@ -323,6 +323,7 @@ public class AccountSession implements AutoCloseable {
                     if (!text.isBlank()) {
                         log("[任务] " + config.displayName() + " " + text);
                         MissionLog.append(config.displayName(), text);
+                        ActionLog.append(config.displayName(), "任务交互 " + text);
                     }
                 }
             } catch (Exception ignored) {
@@ -335,6 +336,19 @@ public class AccountSession implements AutoCloseable {
                     String text = String.valueOf(args[0]);
                     if (!text.isBlank()) {
                         traceLoginEvent(text);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            return null;
+        });
+        // 游戏内操作记录：只落盘到 data/操作记录.txt，不刷控制台，避免高频点击刷屏。
+        context.exposeFunction("__worldAction", args -> {
+            try {
+                if (args != null && args.length > 0 && args[0] != null) {
+                    String text = String.valueOf(args[0]);
+                    if (!text.isBlank()) {
+                        ActionLog.append(config.displayName(), text);
                     }
                 }
             } catch (Exception ignored) {
@@ -1731,6 +1745,7 @@ public class AccountSession implements AutoCloseable {
         evalGlobal(frame, Scripts.load(Scripts.AUTO_GAME));
         evalGlobal(frame, Scripts.load(Scripts.MISSION_LOG));
         evalGlobal(frame, Scripts.load(Scripts.MISSION_SNAPSHOT));
+        evalGlobal(frame, Scripts.load(Scripts.ACTION_LOG));
 
         frame.evaluate("() => { window.__worldDesktopBooted = true; }");
         bootstrapped = true;

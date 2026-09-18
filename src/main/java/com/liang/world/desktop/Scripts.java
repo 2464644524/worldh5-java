@@ -23,6 +23,7 @@ public final class Scripts {
     public static final String SYNC_REPLAY = "scripts/sync_replay.js";
     public static final String MISSION_LOG = "scripts/mission_log.js";
     public static final String MISSION_SNAPSHOT = "scripts/mission_snapshot.js";
+    public static final String ACTION_LOG = "scripts/action_log.js";
 
     private Scripts() {
     }

@@ -556,3 +556,37 @@ git diff --check
 - 切号仍沿用第 18 节规则：每 3 分钟读取一次 AutoGamer 过滤后的自动任务快照，连续 20 次无自动可接/可交任务才关闭当前号并打开下一号。
 
 注意：这里的“5 个号托管”是串行队列托管，同一时刻状态机只自动操作当前账号；导号阶段打开的其它账号在轮到时复用，不重复启动 Edge。
+
+---
+
+## 20. 游戏内操作记录（2026-09-19 00:06 CST）
+
+需求：用户希望把“自己在游戏里干了什么”长期记下来，而不只是任务记录。
+
+实现：
+
+- 新增 `scripts/action_log.js`，在游戏帧注入辅助环境时随任务日志、任务快照之后加载。
+- 新增 Java 日志类 `ActionLog`，写入本机 `data/操作记录.txt`；该目录已被 git 忽略。
+- Playwright 绑定 `__worldAction(text)` 只落盘，不刷控制台，避免高频点击影响界面。
+- 记录范围：
+  - `mousedown/mouseup` 转换为“手动点击/手动拖动”，坐标按 `.egret-player` 归一化；
+  - 事件发生时补充地图 ID、是否城内、角色 `getXKey/getYKey`/坐标；
+  - hook `PopUpManager.addPopUp/removePopUp`，记录打开/关闭面板；
+  - hook `Mission.doMenuButton` 与 `NPC.handlerMissionNPCAction`，记录任务菜单/对话；
+  - 包装 `MsgHandler.create*`，把创建出的消息对象映射回工厂名和参数摘要；
+  - hook `nato.Network.sendCmd`，记录实际发出的网络指令。
+- `__worldLog` 的任务进度日志也同步追加到操作记录，文案前缀为“任务交互”。
+
+安全边界：
+
+- 不记录账号密码、输入框内容、URL query/hash 或 token；
+- 所有 hook 都 try/catch 包裹并透传原函数返回值，失败不影响游戏；
+- 操作记录从新版启动并进入游戏后开始，旧窗口已经发生的操作无法补录。
+
+验证：
+
+```powershell
+node --check src\main\resources\scripts\action_log.js
+.\tools\apache-maven-3.9.11\bin\mvn.cmd -q clean compile
+git diff --check
+```
