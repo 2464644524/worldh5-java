@@ -11,6 +11,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.util.Properties;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -48,8 +49,7 @@ public class SessionManager implements AutoCloseable {
     private final java.util.concurrent.atomic.AtomicReference<String> latestSyncMove =
             new java.util.concurrent.atomic.AtomicReference<>();
 
-    // 单号一键托管：只负责“等待进游戏 → 注入 → 进城 → 开自动 → 持续守护/停止”。
-    // A/B 完成判定和自动切号在后续模块接入，本阶段不自动关闭窗口。
+    // 单号一键托管：等待进游戏 → 注入 → 进城 → 开自动 → 持续守护 → 无主线任务自动切号。
     private static final int PILOT_IDLE = 0;
     private static final int PILOT_OPENING = 1;
     private static final int PILOT_WAIT_GAME = 2;
@@ -65,6 +65,7 @@ public class SessionManager implements AutoCloseable {
     private static final long PILOT_AUTO_TIMEOUT_MS = 30_000L;
     private static final long MISSION_SNAPSHOT_INTERVAL_MS = 3 * 60_000L;
     private static final long MISSION_SNAPSHOT_RETRY_MS = 60_000L;
+    private static final int NO_MISSION_SWITCH_LIMIT = 20;
 
     private volatile int autoPilotIndex = -1;
     private volatile String autoPilotStatus = "";
@@ -79,6 +80,10 @@ public class SessionManager implements AutoCloseable {
     private boolean autoPilotCityRequested;
     private long autoPilotLastRestartAt;
     private long nextMissionSnapshotAt;
+    private int noMissionStreak;
+    private final List<Integer> pilotQueue = new ArrayList<>();
+    private int pilotQueuePosition;
+    private List<Integer> lastLaunchedSlots = new ArrayList<>();
 
     public SessionManager(Path dataDir, Rectangle gameBounds, Consumer<String> logger) {
         this.dataDir = dataDir;
@@ -458,7 +463,9 @@ public class SessionManager implements AutoCloseable {
                 }
             }
 
+            List<Integer> launchedSlots = new ArrayList<>();
             for (int i = 0; i < count; i++) {
+                launchedSlots.add(i);
                 ExcelAccount excelAccount = excelAccounts.get(i);
                 AccountConfig config = store.account(i);
                 Channel channel = excelAccount.getChannel();
@@ -513,6 +520,7 @@ public class SessionManager implements AutoCloseable {
                 }
             }
 
+            lastLaunchedSlots = launchedSlots;
             store.save();
             if (excelAccounts.size() > ConfigStore.ACCOUNT_COUNT) {
                 log("Excel 中有 " + excelAccounts.size()
@@ -672,9 +680,14 @@ public class SessionManager implements AutoCloseable {
             autoPilotRestartCount = 0;
             autoPilotCityRequested = false;
             nextMissionSnapshotAt = 0L;
+            noMissionStreak = 0;
+            pilotQueue.clear();
+            pilotQueue.addAll(buildPilotQueue(safeIndex));
+            pilotQueuePosition = 0;
             autoPilotPhase = PILOT_OPENING;
             setAutoPilotStatus("正在打开浏览器");
             log("[托管] 开始处理 " + store.account(safeIndex).displayName());
+            log("[托管] 自动切号队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
 
             try {
                 session.open(playwright);
@@ -844,7 +857,8 @@ public class SessionManager implements AutoCloseable {
                             autoPilotPhaseAt = now;
                             autoPilotNextActionAt = now + 10_000L;
                             autoPilotRestartCount = 0;
-                            nextMissionSnapshotAt = now + 10_000L;
+                            // 严格按 3 分钟检查一次；连续 20 次无主线可接/可交，即约 60 分钟保底切号。
+                            nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
                             log("[托管] 自动任务已开启，进入持续守护 " + pilotDisplayName());
                         } else if (now - autoPilotPhaseAt > PILOT_AUTO_TIMEOUT_MS) {
                             failAutoPilot("自动任务开启后未检测到运行状态");
@@ -858,9 +872,15 @@ public class SessionManager implements AutoCloseable {
                     if (autoOn) {
                         autoPilotRestartCount = 0;
                         autoPilotNextActionAt = now + 10_000L;
-                        pollMissionSnapshot(session, now);
+                        boolean switched = pollMissionSnapshot(session, now);
+                        if (switched) {
+                            return;
+                        }
+                        String noTaskText = noMissionStreak > 0
+                                ? "，无主线 " + noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
+                                : "";
                         setAutoPilotStatus("自动任务运行中（已托管 "
-                                + elapsedText(now - autoPilotStartedAt) + "）");
+                                + elapsedText(now - autoPilotStartedAt) + noTaskText + "）");
                     } else if (now < autoPilotNextActionAt) {
                         setAutoPilotStatus("自动任务状态确认中");
                     } else if (autoPilotRestartCount >= 3) {
@@ -887,9 +907,9 @@ public class SessionManager implements AutoCloseable {
             failAutoPilot("托管异常: " + e.getMessage());
         }
     }
-    private void pollMissionSnapshot(AccountSession session, long now) {
+    private boolean pollMissionSnapshot(AccountSession session, long now) {
         if (nextMissionSnapshotAt == 0L || now < nextMissionSnapshotAt) {
-            return;
+            return false;
         }
         String name = pilotDisplayName();
         try {
@@ -901,34 +921,188 @@ public class SessionManager implements AutoCloseable {
                 String text = "[任务快照] 读取失败，60秒后重试：" + error;
                 log(text + " " + name);
                 MissionSnapshotLog.append(name, "读取失败：" + error);
-                return;
+                return false;
             }
 
-            int canAcceptCount = optionalInt(snapshot, "canAcceptCount");
-            int canSubmitCount = optionalInt(snapshot, "canSubmitCount");
-            String acceptNames = missionNames(snapshot.getAsJsonArray("canAccept"));
-            String submitNames = missionNames(snapshot.getAsJsonArray("canSubmit"));
+            int rawAcceptCount = optionalInt(snapshot, "canAcceptCount");
+            int rawSubmitCount = optionalInt(snapshot, "canSubmitCount");
+            int autoAcceptCount = optionalInt(snapshot, "autoCanAcceptCount");
+            int autoSubmitCount = optionalInt(snapshot, "autoCanSubmitCount");
+            int ignoredCount = optionalInt(snapshot, "ignoredNonAutoCount");
+            JsonArray autoAccept = snapshot.has("autoCanAccept") && snapshot.get("autoCanAccept").isJsonArray()
+                    ? snapshot.getAsJsonArray("autoCanAccept") : new JsonArray();
+            JsonArray autoSubmit = snapshot.has("autoCanSubmit") && snapshot.get("autoCanSubmit").isJsonArray()
+                    ? snapshot.getAsJsonArray("autoCanSubmit") : new JsonArray();
+            JsonArray ignored = snapshot.has("ignoredNonAuto") && snapshot.get("ignoredNonAuto").isJsonArray()
+                    ? snapshot.getAsJsonArray("ignoredNonAuto") : new JsonArray();
+            String acceptNames = missionNames(autoAccept);
+            String submitNames = missionNames(autoSubmit);
+            String ignoredNames = missionNames(ignored);
             String scanned = snapshot.has("scanned") && !snapshot.get("scanned").isJsonNull()
                     ? snapshot.get("scanned").getAsString() : "0";
 
-            String detail;
-            if (canAcceptCount == 0 && canSubmitCount == 0) {
-                detail = "未发现可接/可交任务（扫描任务对象=" + scanned + "）";
-            } else {
-                detail = "可接=" + canAcceptCount + " 可交=" + canSubmitCount;
-                if (!acceptNames.isEmpty()) detail += "｜可接：" + acceptNames;
-                if (!submitNames.isEmpty()) detail += "｜可交：" + submitNames;
+            StringBuilder detail = new StringBuilder();
+            detail.append("主线可接=").append(autoAcceptCount)
+                    .append(" 主线可交=").append(autoSubmitCount);
+            if (ignoredCount > 0) {
+                detail.append("｜忽略城市/支线=").append(ignoredCount);
             }
+            if (!acceptNames.isEmpty()) detail.append("｜主线可接：").append(acceptNames);
+            if (!submitNames.isEmpty()) detail.append("｜主线可交：").append(submitNames);
+            if (!ignoredNames.isEmpty()) detail.append("｜忽略：").append(ignoredNames);
+            detail.append("｜原始可接=").append(rawAcceptCount)
+                    .append(" 原始可交=").append(rawSubmitCount)
+                    .append(" 扫描对象=").append(scanned);
+
             String text = "[任务快照] " + detail;
             log(text + " " + name);
-            MissionSnapshotLog.append(name, detail + "｜扫描任务对象=" + scanned);
+            MissionSnapshotLog.append(name, detail.toString());
+
+            if (autoAcceptCount > 0 || autoSubmitCount > 0) {
+                if (noMissionStreak > 0) {
+                    log("[托管] 检测到主线任务，无任务计数已清零 " + name);
+                }
+                noMissionStreak = 0;
+                nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+                return false;
+            }
+
+            noMissionStreak++;
+            log("[托管] 无主线任务计数 " + noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
+                    + "（连续约60分钟无主线可接/可交后切号） " + name);
+            MissionSnapshotLog.append(name, "无主线任务计数 " + noMissionStreak
+                    + "/" + NO_MISSION_SWITCH_LIMIT);
             nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+
+            if (noMissionStreak >= NO_MISSION_SWITCH_LIMIT) {
+                log("[托管] 连续 " + NO_MISSION_SWITCH_LIMIT
+                        + " 次无主线可接/可交任务，开始切换下一个账号 " + name);
+                return switchToNextPilotAccount(now);
+            }
+            return false;
         } catch (Exception e) {
+            // 读取异常不计数，避免网络/页面瞬时异常导致误切号；60 秒后重试。
             nextMissionSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
             String text = "[任务快照] 读取异常，60秒后重试：" + e.getMessage();
             log(text + " " + name);
             MissionSnapshotLog.append(name, "读取异常：" + e.getMessage());
+            return false;
         }
+    }
+
+    private List<Integer> buildPilotQueue(int selected) {
+        List<Integer> base = new ArrayList<>();
+        if (!lastLaunchedSlots.isEmpty() && lastLaunchedSlots.contains(selected)) {
+            for (Integer slot : lastLaunchedSlots) {
+                if (slot != null && slot >= 0 && slot < sessions.length && !base.contains(slot)) {
+                    base.add(slot);
+                }
+            }
+        } else {
+            for (int i = 0; i < sessions.length; i++) {
+                if (hasPilotLoginConfig(i)) {
+                    base.add(i);
+                }
+            }
+            if (!base.contains(selected)) {
+                base.add(0, selected);
+            }
+        }
+
+        int start = base.indexOf(selected);
+        if (start < 0) start = 0;
+        List<Integer> queue = new ArrayList<>();
+        queue.addAll(base.subList(start, base.size()));
+        queue.addAll(base.subList(0, start));
+        return queue;
+    }
+
+    private boolean hasPilotLoginConfig(int index) {
+        AccountConfig config = store.account(index);
+        if (config.getCustomUrl() != null && !config.getCustomUrl().isBlank()) {
+            return true;
+        }
+        return config.getChannel() == Channel.GUANFANG
+                && config.getUsername() != null && !config.getUsername().isBlank()
+                && config.getPassword() != null && !config.getPassword().isBlank();
+    }
+
+    private String pilotQueueText() {
+        List<String> names = new ArrayList<>();
+        for (Integer slot : pilotQueue) {
+            if (slot != null && slot >= 0 && slot < sessions.length) {
+                names.add(store.account(slot).displayName());
+            }
+        }
+        return String.join(" → ", names);
+    }
+
+    private boolean switchToNextPilotAccount(long now) {
+        int oldIndex = autoPilotIndex;
+        int nextPosition = pilotQueuePosition + 1;
+        AccountSession oldSession = oldIndex >= 0 && oldIndex < sessions.length
+                ? sessions[oldIndex] : null;
+
+        if (nextPosition >= pilotQueue.size()) {
+            if (oldSession != null) {
+                try {
+                    oldSession.stopScriptsIfInGame(false);
+                } catch (Exception ignored) {
+                }
+            }
+            autoPilotActive = false;
+            autoPilotStopRequested = false;
+            autoPilotPhase = PILOT_IDLE;
+            setAutoPilotStatus("队列账号已全部处理完成");
+            log("[托管] 队列账号已全部处理完成");
+            return true;
+        }
+
+        if (oldSession != null) {
+            try {
+                oldSession.stopScriptsIfInGame(false);
+            } catch (Exception ignored) {
+            }
+            try {
+                oldSession.close();
+            } catch (Exception ignored) {
+            }
+            refreshState(oldIndex);
+        }
+
+        int nextIndex = pilotQueue.get(nextPosition);
+        if (nextIndex < 0 || nextIndex >= sessions.length || sessions[nextIndex] == null) {
+            failAutoPilot("切号目标槽位无效");
+            return true;
+        }
+
+        autoPilotIndex = nextIndex;
+        pilotQueuePosition = nextPosition;
+        autoPilotStopRequested = false;
+        autoPilotStartedAt = now;
+        autoPilotPhaseAt = now;
+        autoPilotNextActionAt = now;
+        autoPilotAttempts = 0;
+        autoPilotRestartCount = 0;
+        autoPilotCityRequested = false;
+        noMissionStreak = 0;
+        nextMissionSnapshotAt = 0L;
+        autoPilotPhase = PILOT_OPENING;
+        setAutoPilotStatus("正在切换并打开浏览器");
+
+        try {
+            // 已打开的下一个号会在 open() 内直接复用并前置，不会重复启动 Edge。
+            sessions[nextIndex].open(playwright);
+            refreshState(nextIndex);
+            autoPilotPhase = PILOT_WAIT_GAME;
+            autoPilotPhaseAt = System.currentTimeMillis();
+            autoPilotNextActionAt = autoPilotPhaseAt;
+            setAutoPilotStatus("等待登录、选角并进入游戏");
+            log("[托管] 已切换到下一个账号，开始处理 " + pilotDisplayName());
+        } catch (Exception e) {
+            failAutoPilot("切换账号打开失败: " + e.getMessage());
+        }
+        return true;
     }
 
     private static int optionalInt(JsonObject obj, String key) {

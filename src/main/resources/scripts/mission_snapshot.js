@@ -105,10 +105,54 @@
     return flags;
   }
 
+  function missionAccepted(m) {
+    try {
+      return !!(xself && isFunction(xself.getMissionById) && xself.getMissionById(m.getId()));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function missionBlockedReasons(m, status) {
+    var reasons = [];
+    if (status === "CAN_SUBMIT") return reasons;
+    if (status !== "CAN_ACCEPT") return ["notAutoStatus"];
+
+    // AutoGamer 原生逻辑：已经接取在身的任务直接算可自动处理。
+    if (missionAccepted(m)) return reasons;
+
+    try {
+      if (typeof Mission !== "undefined" && isFunction(Mission.isMissionFinish)
+          && Mission.isMissionFinish(xself, m.getId())) {
+        reasons.push("isMissionFinish");
+      }
+    } catch (e) {}
+
+    var methods = [
+      "isOneKeyMission",
+      "isCityBulltinMission",
+      "isCountryAssignTask",
+      "isDirectSubmit",
+      "isUnLimitSubmit",
+      "isNestedMission",
+      "isEscort",
+      "isRandomMission"
+    ];
+    for (var i = 0; i < methods.length; i++) {
+      try {
+        if (isFunction(m[methods[i]]) && m[methods[i]]()) reasons.push(methods[i]);
+      } catch (e) {}
+    }
+    return reasons;
+  }
+
   function SnapshotState() {
     this.map = new Map();
     this.canAccept = [];
     this.canSubmit = [];
+    this.autoCanAccept = [];
+    this.autoCanSubmit = [];
+    this.ignoredNonAuto = [];
     this.sources = [];
     this.scanned = 0;
     this.ignored = 0;
@@ -146,6 +190,7 @@
     var key = String(id) + "|" + status;
     var item = state.map.get(key);
     if (!item) {
+      var reasons = missionBlockedReasons(m, status);
       item = {
         id: id,
         name: missionName(m),
@@ -153,10 +198,18 @@
         sources: [],
         npcIds: [],
         npcNames: [],
-        kind: missionKind(m)
+        kind: missionKind(m),
+        nonAutoReasons: reasons
       };
       state.map.set(key, item);
-      (status === "CAN_ACCEPT" ? state.canAccept : state.canSubmit).push(item);
+      if (status === "CAN_ACCEPT") {
+        state.canAccept.push(item);
+        if (reasons.length === 0) state.autoCanAccept.push(item);
+        else state.ignoredNonAuto.push(item);
+      } else {
+        state.canSubmit.push(item);
+        state.autoCanSubmit.push(item);
+      }
     }
     addUnique(item.sources, source, 8);
     if (npc) {
@@ -249,6 +302,9 @@
           canSubmitCount: 0,
           canAccept: [],
           canSubmit: [],
+          autoCanAccept: [],
+          autoCanSubmit: [],
+          ignoredNonAuto: [],
           scanned: 0,
           sources: [],
           error: "游戏核心对象未就绪"
@@ -259,8 +315,13 @@
       scanOpenDialogue(state);
       var totalCanAccept = state.canAccept.length;
       var totalCanSubmit = state.canSubmit.length;
+      var autoCanAccept = state.autoCanAccept.length;
+      var autoCanSubmit = state.autoCanSubmit.length;
       sortItems(state.canAccept);
       sortItems(state.canSubmit);
+      sortItems(state.autoCanAccept);
+      sortItems(state.autoCanSubmit);
+      sortItems(state.ignoredNonAuto);
 
       var mapId = 0;
       var inCity = false;
@@ -273,6 +334,12 @@
         canSubmitCount: totalCanSubmit,
         canAccept: state.canAccept,
         canSubmit: state.canSubmit,
+        autoCanAcceptCount: autoCanAccept,
+        autoCanSubmitCount: autoCanSubmit,
+        autoCanAccept: state.autoCanAccept,
+        autoCanSubmit: state.autoCanSubmit,
+        ignoredNonAutoCount: state.ignoredNonAuto.length,
+        ignoredNonAuto: state.ignoredNonAuto,
         scanned: state.scanned,
         sources: state.sources,
         inCity: inCity,
@@ -286,6 +353,9 @@
         canSubmitCount: 0,
         canAccept: [],
         canSubmit: [],
+        autoCanAccept: [],
+        autoCanSubmit: [],
+        ignoredNonAuto: [],
         scanned: state.scanned,
         sources: state.sources,
         error: e && e.message ? String(e.message) : String(e)
