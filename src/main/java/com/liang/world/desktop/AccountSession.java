@@ -613,6 +613,38 @@ public class AccountSession implements AutoCloseable {
         }
     }
 
+    // 只读获取当前任务快照。必须在 playwright-worker 内调用；不点击、不接取、不切换游戏状态。
+    public synchronized JsonObject readMissionSnapshot() {
+        ensureOpen();
+        Optional<Frame> gameFrame = locateGameFrame(true);
+        if (gameFrame.isEmpty()) {
+            throw new IllegalStateException("还没进入游戏，无法读取任务快照: " + config.displayName());
+        }
+        Frame frame = gameFrame.get();
+        // 兼容注入后新增快照模块的情况：这里只重新定义只读 API，不改变游戏状态。
+        evalGlobal(frame, Scripts.load(Scripts.MISSION_SNAPSHOT));
+        Object raw = frame.evaluate("""
+                () => {
+                    try {
+                        if (!window.WorldMissionSnapshot
+                                || typeof window.WorldMissionSnapshot.snapshot !== 'function') {
+                            return JSON.stringify({ ok: false, error: '任务快照脚本未就绪' });
+                        }
+                        return JSON.stringify(window.WorldMissionSnapshot.snapshot());
+                    } catch (e) {
+                        return JSON.stringify({
+                            ok: false,
+                            error: e && e.message ? String(e.message) : String(e)
+                        });
+                    }
+                }
+                """);
+        if (raw == null) {
+            throw new IllegalStateException("任务快照返回为空: " + config.displayName());
+        }
+        return JsonParser.parseString(String.valueOf(raw)).getAsJsonObject();
+    }
+
     public synchronized void enterCity() {
         enterCity(true);
     }
@@ -1698,6 +1730,7 @@ public class AccountSession implements AutoCloseable {
         evalGlobal(frame, Scripts.load(Scripts.LOOP_GAME));
         evalGlobal(frame, Scripts.load(Scripts.AUTO_GAME));
         evalGlobal(frame, Scripts.load(Scripts.MISSION_LOG));
+        evalGlobal(frame, Scripts.load(Scripts.MISSION_SNAPSHOT));
 
         frame.evaluate("() => { window.__worldDesktopBooted = true; }");
         bootstrapped = true;

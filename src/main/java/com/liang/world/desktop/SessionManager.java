@@ -1,5 +1,8 @@
 package com.liang.world.desktop;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.microsoft.playwright.Playwright;
 
 import java.awt.Rectangle;
@@ -60,6 +63,8 @@ public class SessionManager implements AutoCloseable {
     private static final long PILOT_LOGIN_TIMEOUT_MS = 10 * 60_000L;
     private static final long PILOT_CITY_TIMEOUT_MS = 60_000L;
     private static final long PILOT_AUTO_TIMEOUT_MS = 30_000L;
+    private static final long MISSION_SNAPSHOT_INTERVAL_MS = 3 * 60_000L;
+    private static final long MISSION_SNAPSHOT_RETRY_MS = 60_000L;
 
     private volatile int autoPilotIndex = -1;
     private volatile String autoPilotStatus = "";
@@ -73,6 +78,7 @@ public class SessionManager implements AutoCloseable {
     private int autoPilotRestartCount;
     private boolean autoPilotCityRequested;
     private long autoPilotLastRestartAt;
+    private long nextMissionSnapshotAt;
 
     public SessionManager(Path dataDir, Rectangle gameBounds, Consumer<String> logger) {
         this.dataDir = dataDir;
@@ -665,6 +671,7 @@ public class SessionManager implements AutoCloseable {
             autoPilotAttempts = 0;
             autoPilotRestartCount = 0;
             autoPilotCityRequested = false;
+            nextMissionSnapshotAt = 0L;
             autoPilotPhase = PILOT_OPENING;
             setAutoPilotStatus("正在打开浏览器");
             log("[托管] 开始处理 " + store.account(safeIndex).displayName());
@@ -837,6 +844,7 @@ public class SessionManager implements AutoCloseable {
                             autoPilotPhaseAt = now;
                             autoPilotNextActionAt = now + 10_000L;
                             autoPilotRestartCount = 0;
+                            nextMissionSnapshotAt = now + 10_000L;
                             log("[托管] 自动任务已开启，进入持续守护 " + pilotDisplayName());
                         } else if (now - autoPilotPhaseAt > PILOT_AUTO_TIMEOUT_MS) {
                             failAutoPilot("自动任务开启后未检测到运行状态");
@@ -850,6 +858,7 @@ public class SessionManager implements AutoCloseable {
                     if (autoOn) {
                         autoPilotRestartCount = 0;
                         autoPilotNextActionAt = now + 10_000L;
+                        pollMissionSnapshot(session, now);
                         setAutoPilotStatus("自动任务运行中（已托管 "
                                 + elapsedText(now - autoPilotStartedAt) + "）");
                     } else if (now < autoPilotNextActionAt) {
@@ -878,6 +887,90 @@ public class SessionManager implements AutoCloseable {
             failAutoPilot("托管异常: " + e.getMessage());
         }
     }
+    private void pollMissionSnapshot(AccountSession session, long now) {
+        if (nextMissionSnapshotAt == 0L || now < nextMissionSnapshotAt) {
+            return;
+        }
+        String name = pilotDisplayName();
+        try {
+            JsonObject snapshot = session.readMissionSnapshot();
+            if (!snapshot.has("ok") || !snapshot.get("ok").getAsBoolean()) {
+                String error = snapshot.has("error") && !snapshot.get("error").isJsonNull()
+                        ? snapshot.get("error").getAsString() : "未知错误";
+                nextMissionSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
+                String text = "[任务快照] 读取失败，60秒后重试：" + error;
+                log(text + " " + name);
+                MissionSnapshotLog.append(name, "读取失败：" + error);
+                return;
+            }
+
+            int canAcceptCount = optionalInt(snapshot, "canAcceptCount");
+            int canSubmitCount = optionalInt(snapshot, "canSubmitCount");
+            String acceptNames = missionNames(snapshot.getAsJsonArray("canAccept"));
+            String submitNames = missionNames(snapshot.getAsJsonArray("canSubmit"));
+            String scanned = snapshot.has("scanned") && !snapshot.get("scanned").isJsonNull()
+                    ? snapshot.get("scanned").getAsString() : "0";
+
+            String detail;
+            if (canAcceptCount == 0 && canSubmitCount == 0) {
+                detail = "未发现可接/可交任务（扫描任务对象=" + scanned + "）";
+            } else {
+                detail = "可接=" + canAcceptCount + " 可交=" + canSubmitCount;
+                if (!acceptNames.isEmpty()) detail += "｜可接：" + acceptNames;
+                if (!submitNames.isEmpty()) detail += "｜可交：" + submitNames;
+            }
+            String text = "[任务快照] " + detail;
+            log(text + " " + name);
+            MissionSnapshotLog.append(name, detail + "｜扫描任务对象=" + scanned);
+            nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+        } catch (Exception e) {
+            nextMissionSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
+            String text = "[任务快照] 读取异常，60秒后重试：" + e.getMessage();
+            log(text + " " + name);
+            MissionSnapshotLog.append(name, "读取异常：" + e.getMessage());
+        }
+    }
+
+    private static int optionalInt(JsonObject obj, String key) {
+        try {
+            return obj.has(key) && !obj.get(key).isJsonNull() ? obj.get(key).getAsInt() : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static String missionNames(JsonArray items) {
+        if (items == null || items.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        int limit = Math.min(items.size(), 10);
+        for (int i = 0; i < limit; i++) {
+            JsonElement element = items.get(i);
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject item = element.getAsJsonObject();
+            String title = "";
+            if (item.has("name") && item.get("name").isJsonPrimitive()) {
+                title = item.get("name").getAsString().trim();
+            }
+            String id = item.has("id") && !item.get("id").isJsonNull()
+                    ? item.get("id").getAsString() : "";
+            if (!sb.isEmpty()) {
+                sb.append("、");
+            }
+            sb.append(title.isEmpty() ? "任务#" + id : title);
+            if (!id.isEmpty()) {
+                sb.append("#").append(id);
+            }
+        }
+        if (items.size() > limit) {
+            sb.append("等").append(items.size()).append("个");
+        }
+        return sb.toString();
+    }
+
     private void failAutoPilot(String reason) {
         String name = pilotDisplayName();
         autoPilotActive = false;

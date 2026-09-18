@@ -463,3 +463,46 @@ hook 只在注入后的游戏帧生效，需重开窗口。
 - 控制台日志明确区分为：`画布点击加载页“进入游戏”按钮`、`选择角色界面`、`画布兜底点击选角页“进入游戏”按钮`。
 
 验证：`mvn -q clean compile` 通过。
+
+---
+
+## 17. 任务快照监控（2026-09-18 19:02 CST）
+
+目的：在自动登录、进城、开启自动任务链路已打通后，先只读记录当前账号是否还有 `CAN_ACCEPT`
+（可接）和 `CAN_SUBMIT`（可交）任务，为后续“60 分钟宽限期 + 连续 20 次无任务切号”做数据验证。
+本阶段不自动切号。
+
+实现：
+
+- 新增 `scripts/mission_snapshot.js`，注入游戏帧后只定义 `window.WorldMissionSnapshot.snapshot()`。
+- 新增 Java 读取方法 `AccountSession.readMissionSnapshot()`，在 playwright-worker 线程中调用并返回 Gson JSON。
+- 新增 `MissionSnapshotLog`，把快照长期追加到 `data/任务快照.txt`（该目录已被 git 忽略）。
+- `SessionManager` 在单号托管状态机确认 `TestAutoGame` 已运行后：
+  1. 10 秒后读取首次快照；
+  2. 正常每 3 分钟读取一次；
+  3. 读取失败或游戏对象暂未就绪时，60 秒后重试；
+  4. 快照异常不改变托管状态、不停止自动任务。
+
+任务来源：
+
+- `xself.missionList`：角色当前已接任务，可从中识别 `CAN_SUBMIT`；
+- `xworld.npcList[*].missionList` 和 `xworld.npcList[*].missions`：当前地图 NPC 可提供的任务；
+- `PanelManager.npcDialogue._actionList[*].data.mission`：已打开 NPC 对话时补充读取；
+- `missionData` 做防御式兼容，非 Mission 对象会跳过。
+
+安全边界：
+
+- 状态必须精确等于 `MissionConst.CAN_ACCEPT` 或 `MissionConst.CAN_SUBMIT`；
+  不使用 `indexOf`，避免把 `NOT_CAN_ACCEPT` / `NOT_CAN_SUBMIT` 误判；
+- 不调用接取、提交、寻路、网络发送等接口；
+- 不记录 URL、token、账号密码；
+- 明细最多展示 30 条，扫描最多处理 2000 个候选任务对象，避免拖慢游戏。
+
+验证：
+
+```powershell
+.\tools\apache-maven-3.9.11\bin\mvn.cmd -q clean compile
+node --check src/main/resources/scripts/mission_snapshot.js
+```
+
+均已通过。需要完全关闭控制台和所有由控制台启动的 Edge，再双击 `run.cmd` 才会加载新注入脚本。
