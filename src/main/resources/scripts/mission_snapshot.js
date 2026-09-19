@@ -113,6 +113,18 @@
     }
   }
 
+  function isInCityContext() {
+    try {
+      if (typeof xworld !== "undefined" && xworld) {
+        if (isFunction(xworld.isInCityNow) && xworld.isInCityNow()) return true;
+        // 兜底：当前版本回城后的城市地图 ID 为 14748。
+        var mapId = isFunction(xworld.getCurMapID) ? xworld.getCurMapID() : xworld.mapId;
+        if (Number(mapId) === 14748) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
   function missionBlockedReasons(m, status) {
     var reasons = [];
     if (status === "CAN_SUBMIT") return reasons;
@@ -143,6 +155,19 @@
         if (isFunction(m[methods[i]]) && m[methods[i]]()) reasons.push(methods[i]);
       } catch (e) {}
     }
+
+    // 实测回城后市长/城市 NPC 会长期挂着 3000 段功能、介绍、加工、兑换、领取类 CAN_ACCEPT。
+    // 这些不是 AutoGamer 会继续跑的野外主线；但同段任务若已达到 CAN_SUBMIT，前面会直接放行计为可交。
+    // 只在“当前位于城内”时按 ID 兜底过滤，避免误杀野外地图里的 3022~3026 等任务。
+    try {
+      var missionNumericId = Number(m.getId());
+      if (isInCityContext()
+          && Number.isFinite(missionNumericId)
+          && missionNumericId >= 3000 && missionNumericId <= 3999) {
+        reasons.push("cityFunctionalAccept");
+      }
+    } catch (e) {}
+
     return reasons;
   }
 

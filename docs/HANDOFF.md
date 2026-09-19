@@ -590,3 +590,26 @@ node --check src\main\resources\scripts\action_log.js
 .\tools\apache-maven-3.9.11\bin\mvn.cmd -q clean compile
 git diff --check
 ```
+
+---
+
+## 21. 修正城内 3000 段功能任务导致无法切号（2026-09-19 09:10 CST）
+
+现象：账号 01 托管一整夜未切号，`data/任务快照.txt` 从凌晨到 09:07 持续显示：
+
+```text
+主线可接=9 主线可交=0｜忽略城市/支线=5
+主线可接：升级到四级城市#3004、与太阳之城的联系#3020、初级木材/石材/铁矿加工、
+国家专用发展证领取#3030、世界骑士/英雄勋章兑换#3090/#3091、勋章合并#3092
+```
+
+这 9 个任务位于回城后的市长/城市 NPC，属于城市功能、加工、兑换、领取或介绍任务，不是 AutoGamer 会继续跑的野外主线。旧过滤只排除了其中 5 个公告/介绍任务，剩余 9 个不断把无任务计数清零，所以不会达到 20 次切号阈值。
+
+修正：
+
+- `mission_snapshot.js` 新增 `isInCityContext()`：`xworld.isInCityNow()` 为真，或当前地图 ID 为城市地图 `14748`。
+- 在城内时，未接取的 `3000–3999` 段 `CAN_ACCEPT` 任务统一标记为 `cityFunctionalAccept`，计入“忽略城市/支线”。
+- 同 ID 如果状态是 `CAN_SUBMIT`，仍在函数开头放行，计入自动可交任务，避免漏掉城市阶段奖励提交。
+- 该 ID 兜底只在城内生效，避免误杀野外地图里的 3022–3026 等普通任务。
+
+验证：`node --check mission_snapshot.js`、`mvn -q clean compile`、`git diff --check` 均通过。必须完全重启控制台和所有 Edge 游戏窗口后生效。
