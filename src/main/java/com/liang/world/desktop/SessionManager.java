@@ -680,36 +680,49 @@ public class SessionManager implements AutoCloseable {
                 return;
             }
 
-            int first = findNextUnfinishedPilotSlot();
-            if (first < 0) {
-                // 当前槽位可能已经跑完并写入了今天日期；此时不要直接结束，重新读取 Excel 接力下一个未完成账号。
-                try {
-                    ExcelAccount next = findNextUnfinishedExcelAccount();
-                    if (next == null) {
-                        String text = "今天可托管账号都已跑完（Excel 完成日期为 " + LocalDate.now() + "）";
-                        log("[托管] " + text);
-                        PilotLog.append("", text);
-                        setAutoPilotStatus("今日账号已全部跑完");
-                        return;
-                    }
-                    first = 0;
-                    try {
-                        if (sessions[first] != null && sessions[first].isOpen()) {
-                            sessions[first].close();
-                        }
-                        refreshState(first);
-                    } catch (Exception ignored) {
-                    }
-                    applyExcelAccountToPilotSlot(first, next);
-                    PilotLog.append("", "全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
-                    log("[托管] 全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
-                } catch (Exception e) {
-                    failAutoPilot("重新读取 Excel 寻找未完成账号失败: " + e.getMessage());
-                    PilotLog.append("", "全托启动时读取 Excel 失败: " + e.getMessage());
-                    return;
-                }
+            // 全托以磁盘上“已保存”的 Excel 为唯一准绳，避免继续使用本地槽位里刚载入的旧账号。
+            pilotHandledExcelRows.clear();
+            List<ExcelAccount> accounts;
+            try {
+                accounts = readExcelAccountsSnapshot();
+            } catch (Exception e) {
+                failAutoPilot("读取固定 Excel 失败，请先在 WPS/Excel 中保存后重试: " + e.getMessage());
+                PilotLog.append("", "全托启动读取 Excel 失败: " + e.getMessage());
+                return;
             }
-            beginAutoPilot(first);
+
+            reconcilePilotSlotsWithExcel(accounts);
+
+            ExcelAccount next = firstUnfinishedExcelAccount(accounts);
+            if (next == null) {
+                String text = "今天可托管账号都已跑完（Excel 完成日期为 " + LocalDate.now() + "）";
+                log("[托管] " + text);
+                PilotLog.append("", text);
+                setAutoPilotStatus("今日账号已全部跑完");
+                return;
+            }
+
+            int target = findSlotConfiguredForExcelRow(next.getRowNumber());
+            if (target < 0) {
+                target = 0;
+                try {
+                    if (sessions[target] != null && sessions[target].isOpen()) {
+                        sessions[target].close();
+                    }
+                    refreshState(target);
+                } catch (Exception ignored) {
+                }
+                applyExcelAccountToPilotSlot(target, next);
+                PilotLog.append("", "全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
+                log("[托管] 全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
+            } else {
+                PilotLog.append("", "全托启动时匹配到本地槽位 "
+                        + String.format("%02d", target + 1) + "，对应 Excel第 " + next.getRowNumber() + " 行");
+                log("[托管] 全托启动时使用槽位 " + String.format("%02d", target + 1)
+                        + "，Excel第 " + next.getRowNumber() + " 行");
+            }
+
+            beginAutoPilot(target);
         });
     }
 
@@ -1301,6 +1314,10 @@ public class SessionManager implements AutoCloseable {
     }
 
     private ExcelAccount findNextUnfinishedExcelAccount() throws Exception {
+        return firstUnfinishedExcelAccount(readExcelAccountsSnapshot());
+    }
+
+    private List<ExcelAccount> readExcelAccountsSnapshot() throws Exception {
         Path excelFile = dataDir.resolve("账号.xlsx");
         if (!Files.isRegularFile(excelFile)) {
             throw new java.io.IOException("固定账号表不存在: " + excelFile);
@@ -1309,23 +1326,7 @@ public class SessionManager implements AutoCloseable {
         Path tempFile = Files.createTempFile("world-pilot-accounts-", ".xlsx");
         try {
             Files.copy(excelFile, tempFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            List<ExcelAccount> accounts = ExcelAccountReader.read(tempFile);
-            for (ExcelAccount account : accounts) {
-                if (account == null || account.isFinishedToday()) {
-                    continue;
-                }
-                if (pilotHandledExcelRows.contains(account.getRowNumber())) {
-                    continue;
-                }
-                Channel channel = account.getChannel();
-                boolean valid = channel == Channel.GUANFANG
-                        ? !account.getUsername().isBlank() && !account.getPassword().isBlank()
-                        : !account.getUrl().isBlank();
-                if (valid) {
-                    return account;
-                }
-            }
-            return null;
+            return ExcelAccountReader.read(tempFile);
         } finally {
             try {
                 Files.deleteIfExists(tempFile);
@@ -1334,9 +1335,80 @@ public class SessionManager implements AutoCloseable {
         }
     }
 
+    private ExcelAccount firstUnfinishedExcelAccount(List<ExcelAccount> accounts) {
+        if (accounts == null) {
+            return null;
+        }
+        for (ExcelAccount account : accounts) {
+            if (account == null || account.isFinishedToday()) {
+                continue;
+            }
+            if (pilotHandledExcelRows.contains(account.getRowNumber())) {
+                continue;
+            }
+            Channel channel = account.getChannel();
+            boolean valid = channel == Channel.GUANFANG
+                    ? !account.getUsername().isBlank() && !account.getPassword().isBlank()
+                    : !account.getUrl().isBlank();
+            if (valid) {
+                return account;
+            }
+        }
+        return null;
+    }
+
+    private int findSlotConfiguredForExcelRow(int excelRow) {
+        for (int i = 0; i < sessions.length; i++) {
+            if (store.account(i).getExcelRow() == excelRow) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void reconcilePilotSlotsWithExcel(List<ExcelAccount> accounts) {
+        int count = Math.min(accounts == null ? 0 : accounts.size(), sessions.length);
+        for (int slot = 0; slot < sessions.length; slot++) {
+            AccountConfig config = store.account(slot);
+            if (slot >= count) {
+                config.setTitle(String.valueOf(slot + 1));
+                config.setChannel(Channel.TIANYU);
+                config.setCustomUrl("");
+                config.setUsername("");
+                config.setPassword("");
+                config.setExcelRow(0);
+                config.setFinishDate("");
+                if (sessions[slot] != null) {
+                    sessions[slot].clearOfficialLogin();
+                    if (sessions[slot].isOpen()) {
+                        sessions[slot].close();
+                    }
+                }
+                refreshState(slot);
+                continue;
+            }
+
+            ExcelAccount account = accounts.get(slot);
+            boolean sameRow = config.getExcelRow() == account.getRowNumber();
+            boolean open = sessions[slot] != null && sessions[slot].isOpen();
+            if (open && (!sameRow || account.isFinishedToday())) {
+                sessions[slot].close();
+                refreshState(slot);
+                open = false;
+            }
+            applyExcelAccountToPilotSlot(slot, account, !open || !sameRow);
+            refreshState(slot);
+        }
+    }
+
     private void applyExcelAccountToPilotSlot(int slot, ExcelAccount excelAccount) {
+        applyExcelAccountToPilotSlot(slot, excelAccount, true);
+    }
+
+    private void applyExcelAccountToPilotSlot(int slot, ExcelAccount excelAccount, boolean forceFreshLogin) {
         AccountConfig config = store.account(slot);
         Channel channel = excelAccount.getChannel();
+        boolean sameRow = config.getExcelRow() == excelAccount.getRowNumber();
 
         config.setTitle(excelAccount.getDisplayName());
         config.setChannel(channel);
@@ -1347,12 +1419,16 @@ public class SessionManager implements AutoCloseable {
             config.setCustomUrl("");
             config.setUsername(excelAccount.getUsername());
             config.setPassword(excelAccount.getPassword());
-            sessions[slot].prepareOfficialLogin(excelAccount.getUsername(), excelAccount.getPassword());
+            if (forceFreshLogin || !sameRow) {
+                sessions[slot].prepareOfficialLogin(excelAccount.getUsername(), excelAccount.getPassword());
+            }
         } else {
             config.setCustomUrl(excelAccount.getUrl());
             config.setUsername("");
             config.setPassword("");
-            sessions[slot].prepareFreshChannelLogin();
+            if (forceFreshLogin || !sameRow) {
+                sessions[slot].prepareFreshChannelLogin();
+            }
         }
         store.save();
     }

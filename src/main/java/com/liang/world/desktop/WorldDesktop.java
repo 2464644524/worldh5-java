@@ -339,12 +339,14 @@ public class WorldDesktop extends JFrame {
         }
         int choice = JOptionPane.showConfirmDialog(
                 this,
-                "将从当前账号开始自动托管；当前号连续约60分钟无主线任务后，会重新读取 Excel，自动登录下一个今日未完成账号。是否继续？",
+                "将读取固定 Excel 中今天未完成的账号开始托管。\n"
+                + "请确认 WPS/Excel 已按 Ctrl+S 保存；未保存的完成日期程序读不到。\n"
+                + "当前号连续约60分钟无主线任务后，会重新读取 Excel，自动登录下一个今日未完成账号。是否继续？",
                 "批量托管确认",
                 JOptionPane.OK_CANCEL_OPTION);
         if (choice == JOptionPane.OK_OPTION) {
             manager.startAutoPilotAll();
-            appendLog("开始批量托管：完成一个账号后自动重读 Excel 接力");
+            appendLog("开始批量托管：按已保存 Excel 的今日未完成账号接力");
         }
     }
 
