@@ -83,6 +83,7 @@ public class SessionManager implements AutoCloseable {
     private long nextMissionSnapshotAt;
     private int noMissionStreak;
     private final List<Integer> pilotQueue = new ArrayList<>();
+    private final java.util.Set<Integer> pilotHandledExcelRows = new java.util.HashSet<>();
     private int pilotQueuePosition;
     private List<Integer> lastLaunchedSlots = new ArrayList<>();
 
@@ -527,8 +528,8 @@ public class SessionManager implements AutoCloseable {
             store.save();
             PilotLog.append("", "导号建立自动上号队列（" + launchedSlots.size() + "个）：" + slotNames(launchedSlots));
             if (launchedSlots.size() <= 1) {
-                log("本次只选择了 1 个账号；如需自动切号，请在导号窗口勾选至少 2 个账号");
-                PilotLog.append("", "本次只选择1个账号，自动托管无下一号可切");
+                log("本次打开 1 个账号；当前号完成后会重新读取 Excel，自动接力今日未完成账号");
+                PilotLog.append("", "本次打开1个账号；托管完成后将重读Excel接力未完成账号");
             }
             if (excelAccounts.size() > ConfigStore.ACCOUNT_COUNT) {
                 log("Excel 中有 " + excelAccounts.size()
@@ -681,11 +682,32 @@ public class SessionManager implements AutoCloseable {
 
             int first = findNextUnfinishedPilotSlot();
             if (first < 0) {
-                String text = "今天可托管账号都已跑完（Excel 完成日期为 " + LocalDate.now() + "）";
-                log("[托管] " + text);
-                PilotLog.append("", text);
-                setAutoPilotStatus("今日账号已全部跑完");
-                return;
+                // 当前槽位可能已经跑完并写入了今天日期；此时不要直接结束，重新读取 Excel 接力下一个未完成账号。
+                try {
+                    ExcelAccount next = findNextUnfinishedExcelAccount();
+                    if (next == null) {
+                        String text = "今天可托管账号都已跑完（Excel 完成日期为 " + LocalDate.now() + "）";
+                        log("[托管] " + text);
+                        PilotLog.append("", text);
+                        setAutoPilotStatus("今日账号已全部跑完");
+                        return;
+                    }
+                    first = 0;
+                    try {
+                        if (sessions[first] != null && sessions[first].isOpen()) {
+                            sessions[first].close();
+                        }
+                        refreshState(first);
+                    } catch (Exception ignored) {
+                    }
+                    applyExcelAccountToPilotSlot(first, next);
+                    PilotLog.append("", "全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
+                    log("[托管] 全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
+                } catch (Exception e) {
+                    failAutoPilot("重新读取 Excel 寻找未完成账号失败: " + e.getMessage());
+                    PilotLog.append("", "全托启动时读取 Excel 失败: " + e.getMessage());
+                    return;
+                }
             }
             beginAutoPilot(first);
         });
@@ -710,6 +732,7 @@ public class SessionManager implements AutoCloseable {
 
             long now = System.currentTimeMillis();
             pilotQueue.clear();
+            pilotHandledExcelRows.clear();
             pilotQueue.addAll(buildPilotQueue(safeIndex));
             pilotQueuePosition = 0;
             if (pilotQueue.isEmpty()) {
@@ -751,8 +774,8 @@ public class SessionManager implements AutoCloseable {
             log("[托管] 自动切号队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
             PilotLog.append("", "建立托管队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
             if (pilotQueue.size() <= 1) {
-                log("[托管] 当前队列只有 1 个今日未完成账号；保底后会写入完成日期并结束托管");
-                PilotLog.append(store.account(safeIndex).displayName(), "队列只有1个今日未完成账号，保底后将写入完成日期并结束托管");
+                log("[托管] 当前先处理 1 个账号；该号保底完成后会重新读取 Excel，自动接力今日未完成账号");
+                PilotLog.append(store.account(safeIndex).displayName(), "当前先处理1个账号；完成后将重读Excel接力未完成账号");
             } else {
                 setAutoPilotStatus("等待处理队列 1/" + pilotQueue.size());
             }
@@ -1148,14 +1171,46 @@ public class SessionManager implements AutoCloseable {
         int nextPosition = pilotQueuePosition + 1;
         AccountSession oldSession = oldIndex >= 0 && oldIndex < sessions.length
                 ? sessions[oldIndex] : null;
-        String oldName = oldIndex >= 0 && oldIndex < sessions.length
-                ? store.account(oldIndex).displayName() : "未知账号";
+        AccountConfig oldConfig = oldIndex >= 0 && oldIndex < sessions.length
+                ? store.account(oldIndex) : null;
+        String oldName = oldConfig != null ? oldConfig.displayName() : "未知账号";
+        int oldExcelRow = oldConfig != null ? oldConfig.getExcelRow() : 0;
 
         markPilotAccountFinished(oldIndex);
+        if (oldExcelRow > 0) {
+            pilotHandledExcelRows.add(oldExcelRow);
+        }
 
-        if (nextPosition >= pilotQueue.size()) {
+        // 启动时已经导入并打开过的队列优先处理，保持原有 1→2→3... 槽位顺序。
+        if (nextPosition < pilotQueue.size()) {
             if (oldSession != null) {
-                PilotLog.append(oldName, "队列最后一个账号跑完，停止脚本并保留窗口");
+                PilotLog.append(oldName, "保底无任务，停止脚本并关闭当前账号");
+                try {
+                    oldSession.stopScriptsIfInGame(false);
+                } catch (Exception ignored) {
+                }
+                try {
+                    oldSession.close();
+                } catch (Exception ignored) {
+                }
+                refreshState(oldIndex);
+            }
+            return openPilotSlot(pilotQueue.get(nextPosition), nextPosition, now, oldName);
+        }
+
+        // 固定队列表跑完后，动态重读 Excel：只要还有“完成日期不是今天”的账号，就覆盖当前槽位继续登录托管。
+        ExcelAccount nextExcelAccount;
+        try {
+            nextExcelAccount = findNextUnfinishedExcelAccount();
+        } catch (Exception e) {
+            PilotLog.append(oldName, "重新读取 Excel 寻找下一个账号失败: " + e.getMessage());
+            failAutoPilot("重新读取 Excel 寻找下一个账号失败: " + e.getMessage());
+            return true;
+        }
+
+        if (nextExcelAccount == null) {
+            if (oldSession != null) {
+                PilotLog.append(oldName, "Excel 中今日账号已全部跑完，停止脚本并保留窗口");
                 try {
                     oldSession.stopScriptsIfInGame(false);
                 } catch (Exception ignored) {
@@ -1164,14 +1219,24 @@ public class SessionManager implements AutoCloseable {
             autoPilotActive = false;
             autoPilotStopRequested = false;
             autoPilotPhase = PILOT_IDLE;
-            setAutoPilotStatus("队列账号已全部处理完成");
-            log("[托管] 队列账号已全部处理完成");
-            PilotLog.append(oldName, "队列账号已全部处理完成");
+            setAutoPilotStatus("Excel 今日账号已全部跑完");
+            log("[托管] Excel 中今日账号已全部跑完");
+            PilotLog.append(oldName, "Excel 中今日账号已全部跑完");
             return true;
         }
 
+        int nextIndex = Math.max(0, Math.min(oldIndex, sessions.length - 1));
+        if (sessions[nextIndex] == null) {
+            failAutoPilot("Excel 接力目标槽位无效");
+            return true;
+        }
+
+        PilotLog.append(oldName, "从 Excel 找到下一个未完成账号：Excel第 "
+                + nextExcelAccount.getRowNumber() + " 行，准备关闭当前号并接力登录");
+        log("[托管] 从 Excel 找到下一个未完成账号：Excel第 "
+                + nextExcelAccount.getRowNumber() + " 行，准备接力");
+
         if (oldSession != null) {
-            PilotLog.append(oldName, "保底无任务，停止脚本并关闭当前账号");
             try {
                 oldSession.stopScriptsIfInGame(false);
             } catch (Exception ignored) {
@@ -1183,7 +1248,19 @@ public class SessionManager implements AutoCloseable {
             refreshState(oldIndex);
         }
 
-        int nextIndex = pilotQueue.get(nextPosition);
+        try {
+            applyExcelAccountToPilotSlot(nextIndex, nextExcelAccount);
+        } catch (Exception e) {
+            PilotLog.append(oldName, "写入下一个 Excel 账号配置失败: " + e.getMessage());
+            failAutoPilot("写入下一个 Excel 账号配置失败: " + e.getMessage());
+            return true;
+        }
+
+        pilotQueue.add(nextIndex);
+        return openPilotSlot(nextIndex, nextPosition, now, oldName);
+    }
+
+    private boolean openPilotSlot(int nextIndex, int nextPosition, long now, String oldName) {
         if (nextIndex < 0 || nextIndex >= sessions.length || sessions[nextIndex] == null) {
             PilotLog.append(oldName, "切号失败：目标槽位无效");
             failAutoPilot("切号目标槽位无效");
@@ -1205,7 +1282,6 @@ public class SessionManager implements AutoCloseable {
         setAutoPilotStatus("正在切换并打开浏览器");
 
         try {
-            // 已打开的下一个号会在 open() 内直接复用并前置，不会重复启动 Edge。
             sessions[nextIndex].open(playwright);
             refreshState(nextIndex);
             autoPilotPhase = PILOT_WAIT_GAME;
@@ -1215,12 +1291,70 @@ public class SessionManager implements AutoCloseable {
             String nextName = pilotDisplayName();
             log("[托管] 已切换到下一个账号，开始处理 " + nextName);
             PilotLog.append(nextName, "已切换到队列第 " + (nextPosition + 1)
-                    + "/" + pilotQueue.size() + " 个账号，等待登录、选角并进入游戏");
+                    + " 个账号（Excel第 " + store.account(nextIndex).getExcelRow()
+                    + " 行），等待登录、选角并进入游戏");
         } catch (Exception e) {
             PilotLog.append(oldName, "切换账号打开失败: " + e.getMessage());
             failAutoPilot("切换账号打开失败: " + e.getMessage());
         }
         return true;
+    }
+
+    private ExcelAccount findNextUnfinishedExcelAccount() throws Exception {
+        Path excelFile = dataDir.resolve("账号.xlsx");
+        if (!Files.isRegularFile(excelFile)) {
+            throw new java.io.IOException("固定账号表不存在: " + excelFile);
+        }
+
+        Path tempFile = Files.createTempFile("world-pilot-accounts-", ".xlsx");
+        try {
+            Files.copy(excelFile, tempFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            List<ExcelAccount> accounts = ExcelAccountReader.read(tempFile);
+            for (ExcelAccount account : accounts) {
+                if (account == null || account.isFinishedToday()) {
+                    continue;
+                }
+                if (pilotHandledExcelRows.contains(account.getRowNumber())) {
+                    continue;
+                }
+                Channel channel = account.getChannel();
+                boolean valid = channel == Channel.GUANFANG
+                        ? !account.getUsername().isBlank() && !account.getPassword().isBlank()
+                        : !account.getUrl().isBlank();
+                if (valid) {
+                    return account;
+                }
+            }
+            return null;
+        } finally {
+            try {
+                Files.deleteIfExists(tempFile);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void applyExcelAccountToPilotSlot(int slot, ExcelAccount excelAccount) {
+        AccountConfig config = store.account(slot);
+        Channel channel = excelAccount.getChannel();
+
+        config.setTitle(excelAccount.getDisplayName());
+        config.setChannel(channel);
+        config.setExcelRow(excelAccount.getRowNumber());
+        config.setFinishDate(excelAccount.getFinishDate());
+
+        if (channel == Channel.GUANFANG) {
+            config.setCustomUrl("");
+            config.setUsername(excelAccount.getUsername());
+            config.setPassword(excelAccount.getPassword());
+            sessions[slot].prepareOfficialLogin(excelAccount.getUsername(), excelAccount.getPassword());
+        } else {
+            config.setCustomUrl(excelAccount.getUrl());
+            config.setUsername("");
+            config.setPassword("");
+            sessions[slot].prepareFreshChannelLogin();
+        }
+        store.save();
     }
 
     private void markPilotAccountFinished(int index) {

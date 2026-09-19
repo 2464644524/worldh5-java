@@ -339,12 +339,12 @@ public class WorldDesktop extends JFrame {
         }
         int choice = JOptionPane.showConfirmDialog(
                 this,
-                "将从本次导号队列的第一个账号开始自动托管；当前号连续约60分钟无主线任务后，自动切到下一个账号。是否继续？",
+                "将从当前账号开始自动托管；当前号连续约60分钟无主线任务后，会重新读取 Excel，自动登录下一个今日未完成账号。是否继续？",
                 "批量托管确认",
                 JOptionPane.OK_CANCEL_OPTION);
         if (choice == JOptionPane.OK_OPTION) {
             manager.startAutoPilotAll();
-            appendLog("开始批量托管导号队列");
+            appendLog("开始批量托管：完成一个账号后自动重读 Excel 接力");
         }
     }
 

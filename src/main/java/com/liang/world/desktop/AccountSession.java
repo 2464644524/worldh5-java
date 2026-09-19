@@ -220,6 +220,17 @@ public class AccountSession implements AutoCloseable {
         resetOfficialAutomationState();
     }
 
+    /**
+     * 天宇/小七等 URL 渠道接力换号：强制下一次 open() 使用干净登录态。
+     * 正常打开不调用，避免破坏已登录会话。
+     */
+    public synchronized void prepareFreshChannelLogin() {
+        this.officialUsername = "";
+        this.officialPassword = "";
+        this.forceFreshLogin = true;
+        resetOfficialAutomationState();
+    }
+
     public synchronized String getOfficialUsername() {
         return officialUsername == null ? "" : officialUsername;
     }
@@ -1773,7 +1784,17 @@ public class AccountSession implements AutoCloseable {
         context.addInitScript(Scripts.load(Scripts.SYNC_CAPTURE));
 
         if (forceFreshLogin) {
-            context.addInitScript(officialAccountStorageScript());
+            if (config.getChannel() == Channel.GUANFANG) {
+                context.addInitScript(officialAccountStorageScript());
+            } else {
+                // URL 渠道接力换号时清掉上一个号在本机 Profile 里的站点存储，避免串到上一个角色。
+                context.addInitScript("""
+                        try {
+                            window.sessionStorage && sessionStorage.clear();
+                            window.localStorage && localStorage.clear();
+                        } catch (e) {}
+                        """);
+            }
         }
 
         if (config.getChannel() == Channel.TIANYU) {
