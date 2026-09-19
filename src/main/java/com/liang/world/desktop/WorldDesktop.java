@@ -201,7 +201,17 @@ public class WorldDesktop extends JFrame {
         button.setFont(SMALL_FONT);
         button.setMargin(new Insets(1, 2, 1, 2));
         button.setFocusPainted(false);
-        button.addActionListener(e -> action.run());
+        button.addActionListener(e -> {
+            try {
+                action.run();
+            } catch (RuntimeException ex) {
+                String message = "按钮执行失败：" + ex.getClass().getSimpleName() + " " + ex.getMessage();
+                appendLog(message);
+                ex.printStackTrace();
+                JOptionPane.showMessageDialog(this, message + "\n\n请把命令行红色报错发给开发者。",
+                        "操作失败", JOptionPane.ERROR_MESSAGE);
+            }
+        });
         return button;
     }
 
@@ -433,31 +443,46 @@ public class WorldDesktop extends JFrame {
         if (!java.nio.file.Files.isRegularFile(file)) {
             try {
                 ExcelAccountReader.writeTemplate(file);
-                appendLog("\u56fa\u5b9a\u8d26\u53f7\u8868\u4e0d\u5b58\u5728\uff0c\u5df2\u751f\u6210: " + file.toAbsolutePath());
+                appendLog("固定账号表不存在，已生成: " + file.toAbsolutePath());
                 openFileExternally(file);
                 JOptionPane.showMessageDialog(this,
-                        "\u56fa\u5b9a\u8d26\u53f7\u8868\u5df2\u751f\u6210\u5e76\u6253\u5f00\uff1a\n" + file.toAbsolutePath()
-                                + "\n\n\u8bf7\u6309\u201c\u8d26\u53f7\u3001\u5bc6\u7801\u3001\u5907\u6ce8\u201d\u586b\u5199\u4fdd\u5b58\u540e\uff0c\u518d\u70b9\u4e00\u6b21\u201c\u5bfc\u53f7\u201d\u3002",
-                        "\u8bf7\u5148\u586b\u5199\u8d26\u53f7\u8868", JOptionPane.INFORMATION_MESSAGE);
+                        "固定账号表已生成并打开：\n" + file.toAbsolutePath()
+                                + "\n\n请按渠道、链接、账号、密码、备注、完成日期填写保存后，再点一次“导号”。",
+                        "请先填写账号表", JOptionPane.INFORMATION_MESSAGE);
             } catch (IOException e) {
-                appendLog("\u751f\u6210\u56fa\u5b9a\u8d26\u53f7\u8868\u5931\u8d25: " + e.getMessage());
+                appendLog("生成固定账号表失败: " + e.getMessage());
                 JOptionPane.showMessageDialog(this,
-                        "\u751f\u6210\u56fa\u5b9a\u8d26\u53f7\u8868\u5931\u8d25\uff1a\n" + e.getMessage(),
-                        "\u9519\u8bef", JOptionPane.ERROR_MESSAGE);
+                        "生成固定账号表失败：\n" + e.getMessage(),
+                        "错误", JOptionPane.ERROR_MESSAGE);
             }
             return;
         }
 
-        appendLog("\u5f00\u59cb\u8bfb\u53d6\u56fa\u5b9a\u8d26\u53f7\u8868: " + file.toAbsolutePath());
+        appendLog("开始读取固定账号表: " + file.toAbsolutePath());
         new Thread(() -> {
+            Path tempFile = null;
             try {
-                List<ExcelAccount> accounts = ExcelAccountReader.read(file);
+                // 复制到临时文件读取，避免 WPS/Excel 正在打开表格时锁住原文件。
+                tempFile = Files.createTempFile("world-accounts-", ".xlsx");
+                Files.copy(file, tempFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                List<ExcelAccount> accounts = ExcelAccountReader.read(tempFile);
+                long unfinished = accounts.stream().filter(account -> !account.isFinishedToday()).count();
+                appendLog("固定账号表读取成功：" + accounts.size() + " 个账号，今日未完成 " + unfinished + " 个，正在打开选择窗口");
                 SwingUtilities.invokeLater(() -> showExcelAccountPicker(file.toFile(), accounts));
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                appendLog("读取固定账号表失败: " + e.getClass().getSimpleName() + " " + e.getMessage());
+                e.printStackTrace();
                 SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
-                        "\u8bfb\u53d6\u56fa\u5b9a\u8d26\u53f7\u8868\u5931\u8d25\uff1a\n" + file.toAbsolutePath() + "\n" + e.getMessage(),
-                        "\u8bfb\u53d6\u5931\u8d25", JOptionPane.ERROR_MESSAGE));
-                appendLog("\u8bfb\u53d6\u56fa\u5b9a\u8d26\u53f7\u8868\u5931\u8d25: " + e.getMessage());
+                        "读取固定账号表失败：\n" + file.toAbsolutePath() + "\n"
+                                + e.getClass().getSimpleName() + ": " + e.getMessage(),
+                        "读取失败", JOptionPane.ERROR_MESSAGE));
+            } finally {
+                if (tempFile != null) {
+                    try {
+                        Files.deleteIfExists(tempFile);
+                    } catch (IOException ignored) {
+                    }
+                }
             }
         }, "excel-account-reader").start();
     }
@@ -576,17 +601,19 @@ public class WorldDesktop extends JFrame {
         dialog.setContentPane(root);
         dialog.pack();
         dialog.setSize(900, 560);
-        dialog.setLocationRelativeTo(this);
+        dialog.setLocationRelativeTo(null);
         dialog.setAlwaysOnTop(true);
         dialog.toFront();
         dialog.requestFocus();
         dialog.setVisible(true);
+        dialog.toFront();
+        dialog.requestFocus();
     }
 
     private static class ExcelAccountTableModel extends AbstractTableModel {
         private final List<ExcelAccount> accounts;
         private final boolean[] selected;
-        private final String[] columns = {"\u9009\u62e9", "\u69fd\u4f4d", "\u6e20\u9053", "\u5907\u6ce8", "\u8d26\u53f7/\u94fe\u63a5", "Excel\u884c"};
+        private final String[] columns = {"选择", "槽位", "渠道", "备注", "账号/链接", "Excel行", "完成日期"};
 
         private ExcelAccountTableModel(List<ExcelAccount> accounts) {
             this.accounts = new ArrayList<>(accounts);
