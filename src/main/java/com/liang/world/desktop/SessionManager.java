@@ -64,9 +64,11 @@ public class SessionManager implements AutoCloseable {
     private static final long PILOT_LOGIN_TIMEOUT_MS = 10 * 60_000L;
     private static final long PILOT_CITY_TIMEOUT_MS = 60_000L;
     private static final long PILOT_AUTO_TIMEOUT_MS = 30_000L;
-    private static final long MISSION_SNAPSHOT_INTERVAL_MS = 3 * 60_000L;
+    private static final long MISSION_SNAPSHOT_INTERVAL_MS = 60_000L;
     private static final long MISSION_SNAPSHOT_RETRY_MS = 60_000L;
-    private static final int NO_MISSION_SWITCH_LIMIT = 20;
+    private static final int NO_MISSION_SWITCH_LIMIT = 10;
+    private static final int PILOT_BATCH_SIZE = 5;
+    private static final int PILOT_COMPLETED = 8;
 
     private volatile int autoPilotIndex = -1;
     private volatile String autoPilotStatus = "";
@@ -85,6 +87,10 @@ public class SessionManager implements AutoCloseable {
     private final List<Integer> pilotQueue = new ArrayList<>();
     private final java.util.Set<Integer> pilotHandledExcelRows = new java.util.HashSet<>();
     private int pilotQueuePosition;
+    private final List<PilotState> pilotRunners = new ArrayList<>();
+    private volatile boolean pilotBulkMode;
+    private volatile int pilotBatchNumber;
+    private long pilotBatchFinishedAt;
     private List<Integer> lastLaunchedSlots = new ArrayList<>();
 
     public SessionManager(Path dataDir, Rectangle gameBounds, Consumer<String> logger) {
@@ -569,19 +575,44 @@ public class SessionManager implements AutoCloseable {
     }
 
     public void startAuto(int index) {
-        submit("开启自动失败", () -> sessions[index].startAuto());
+        submit("开启自动失败", () -> {
+            AccountSession session = sessions[index];
+            if (!ensureManualScriptReady(index, "自动")) return;
+            session.startAuto();
+            PilotState runner = findPilotRunner(index);
+            if (runner != null) {
+                runner.manualAutoOff = false;
+                runner.restartCount = 0;
+                runner.noMissionStreak = 0;
+                runner.nextSnapshotAt = System.currentTimeMillis() + MISSION_SNAPSHOT_INTERVAL_MS;
+                runner.status = "自动运行中（手动开启）";
+            }
+        });
     }
 
     public void startRefresh(int index) {
-        submit("开启刷怪失败", () -> sessions[index].startRefresh());
+        submit("开启刷怪失败", () -> {
+            if (!ensureManualScriptReady(index, "刷怪")) return;
+            sessions[index].startRefresh();
+        });
     }
 
     public void startLoop(int index) {
-        submit("开启跟随失败", () -> sessions[index].startLoop());
+        submit("开启跟随失败", () -> {
+            if (!ensureManualScriptReady(index, "跟随")) return;
+            sessions[index].startLoop();
+        });
     }
 
     public void stopScripts(int index) {
-        submit("停止脚本失败", () -> sessions[index].stopScripts());
+        submit("停止脚本失败", () -> {
+            AccountSession session = sessions[index];
+            if (session == null || !session.isOpen()) {
+                log("请先打开账号 " + String.format("%02d", index + 1));
+                return;
+            }
+            session.stopScripts();
+        });
     }
 
     // 某号的自动/刷怪/跟随是否真实运行（AccountSession.FLAG_* 位）。
@@ -590,32 +621,67 @@ public class SessionManager implements AutoCloseable {
         return session != null && (session.scriptFlags() & flagBit) != 0;
     }
 
+    private boolean ensureManualScriptReady(int index, String feature) {
+        AccountSession session = sessions[index];
+        if (session == null || !session.isOpen()) {
+            log("请先打开账号 " + String.format("%02d", index + 1) + " 后再控制" + feature);
+            return false;
+        }
+        if (!session.isBootstrapped()) {
+            log("还没进入游戏，暂不能控制" + feature + " " + store.account(index).displayName());
+            return false;
+        }
+        return true;
+    }
+
     public void toggleAuto(int index) {
         submit("切换自动失败", () -> {
-            if ((sessions[index].scriptFlags() & AccountSession.FLAG_AUTO) != 0) {
-                sessions[index].stopAuto();
+            AccountSession session = sessions[index];
+            if (!ensureManualScriptReady(index, "自动")) return;
+            PilotState runner = findPilotRunner(index);
+            if ((session.scriptFlags() & AccountSession.FLAG_AUTO) != 0) {
+                session.stopAuto();
+                if (runner != null) {
+                    runner.manualAutoOff = true;
+                    runner.status = "自动已手动关闭（托管等待中，不强制开启）";
+                    log("[托管] 检测到手动关闭自动，暂停该号自动守护 "
+                            + store.account(index).displayName());
+                }
             } else {
-                sessions[index].startAuto();
+                session.startAuto(false);
+                if (runner != null) {
+                    runner.manualAutoOff = false;
+                    runner.restartCount = 0;
+                    runner.noMissionStreak = 0;
+                    runner.nextSnapshotAt = System.currentTimeMillis() + MISSION_SNAPSHOT_INTERVAL_MS;
+                    runner.status = "自动运行中（手动开启）";
+                    log("[托管] 检测到手动开启自动，恢复该号托管守护 "
+                            + store.account(index).displayName());
+                }
             }
         });
     }
 
     public void toggleRefresh(int index) {
         submit("切换刷怪失败", () -> {
-            if ((sessions[index].scriptFlags() & AccountSession.FLAG_REFRESH) != 0) {
-                sessions[index].stopRefresh();
+            AccountSession session = sessions[index];
+            if (!ensureManualScriptReady(index, "刷怪")) return;
+            if ((session.scriptFlags() & AccountSession.FLAG_REFRESH) != 0) {
+                session.stopRefresh();
             } else {
-                sessions[index].startRefresh();
+                session.startRefresh(false);
             }
         });
     }
 
     public void toggleLoop(int index) {
         submit("切换跟随失败", () -> {
-            if ((sessions[index].scriptFlags() & AccountSession.FLAG_LOOP) != 0) {
-                sessions[index].stopLoop();
+            AccountSession session = sessions[index];
+            if (!ensureManualScriptReady(index, "跟随")) return;
+            if ((session.scriptFlags() & AccountSession.FLAG_LOOP) != 0) {
+                session.stopLoop();
             } else {
-                sessions[index].startLoop();
+                session.startLoop(false);
             }
         });
     }
@@ -658,6 +724,15 @@ public class SessionManager implements AutoCloseable {
     }
 
     public int getAutoPilotIndex() {
+        PilotState selected = findPilotRunner(autoPilotIndex);
+        if (selected != null && !isTerminalPilotPhase(selected.phase)) {
+            return autoPilotIndex;
+        }
+        for (PilotState runner : pilotRunners) {
+            if (!isTerminalPilotPhase(runner.phase)) {
+                return runner.slot;
+            }
+        }
         return autoPilotIndex;
     }
 
@@ -666,171 +741,119 @@ public class SessionManager implements AutoCloseable {
     }
 
     public int getAutoPilotQueuePosition() {
-        return pilotQueue.isEmpty() ? 0 : pilotQueuePosition + 1;
+        return getFinishedPilotCount() + 1;
     }
 
     public int getAutoPilotQueueSize() {
-        return pilotQueue.size();
+        return Math.max(1, pilotRunners.size());
+    }
+
+    public boolean isSlotPiloted(int slot) {
+        return findPilotRunner(slot) != null;
+    }
+
+    public String getPilotSlotStatus(int slot) {
+        PilotState runner = findPilotRunner(slot);
+        return runner == null || runner.status == null ? "" : runner.status;
+    }
+
+    public int getActivePilotCount() {
+        int count = 0;
+        for (PilotState runner : pilotRunners) {
+            if (!isTerminalPilotPhase(runner.phase)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public int getFinishedPilotCount() {
+        int count = 0;
+        for (PilotState runner : pilotRunners) {
+            if (runner.phase == PILOT_COMPLETED || runner.phase == PILOT_FAILED) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public int getPilotBatchNumber() {
+        return pilotBatchNumber;
+    }
+
+    public boolean isPilotBulkMode() {
+        return pilotBulkMode;
     }
 
     public void startAutoPilotAll() {
         submit("启动批量托管失败", () -> {
             if (autoPilotActive) {
-                log("一键托管正在运行：" + pilotDisplayName());
+                log("一键托管正在运行：" + autoPilotStatus);
                 return;
             }
-
-            // 全托以磁盘上“已保存”的 Excel 为唯一准绳，避免继续使用本地槽位里刚载入的旧账号。
-            pilotHandledExcelRows.clear();
             List<ExcelAccount> accounts;
             try {
                 accounts = readExcelAccountsSnapshot();
             } catch (Exception e) {
-                failAutoPilot("读取固定 Excel 失败，请先在 WPS/Excel 中保存后重试: " + e.getMessage());
+                failGlobalAutoPilot("读取固定 Excel 失败，请先在 WPS/Excel 中保存后重试: " + e.getMessage());
                 PilotLog.append("", "全托启动读取 Excel 失败: " + e.getMessage());
                 return;
             }
 
-            reconcilePilotSlotsWithExcel(accounts);
-
-            ExcelAccount next = firstUnfinishedExcelAccount(accounts);
-            if (next == null) {
+            List<ExcelAccount> batch = unfinishedExcelAccounts(accounts);
+            if (batch.isEmpty()) {
                 String text = "今天可托管账号都已跑完（Excel 完成日期为 " + LocalDate.now() + "）";
                 log("[托管] " + text);
                 PilotLog.append("", text);
                 setAutoPilotStatus("今日账号已全部跑完");
                 return;
             }
-
-            int target = findSlotConfiguredForExcelRow(next.getRowNumber());
-            if (target < 0) {
-                target = 0;
-                try {
-                    if (sessions[target] != null && sessions[target].isOpen()) {
-                        sessions[target].close();
-                    }
-                    refreshState(target);
-                } catch (Exception ignored) {
-                }
-                applyExcelAccountToPilotSlot(target, next);
-                PilotLog.append("", "全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
-                log("[托管] 全托启动时从 Excel 载入未完成账号：Excel第 " + next.getRowNumber() + " 行");
-            } else {
-                PilotLog.append("", "全托启动时匹配到本地槽位 "
-                        + String.format("%02d", target + 1) + "，对应 Excel第 " + next.getRowNumber() + " 行");
-                log("[托管] 全托启动时使用槽位 " + String.format("%02d", target + 1)
-                        + "，Excel第 " + next.getRowNumber() + " 行");
+            if (batch.size() > PILOT_BATCH_SIZE) {
+                batch = new ArrayList<>(batch.subList(0, PILOT_BATCH_SIZE));
             }
-
-            beginAutoPilot(target);
+            startPilotBatch(batch, System.currentTimeMillis());
         });
     }
 
     public void startAutoPilot(int index) {
-        submit("启动一键托管失败", () -> beginAutoPilot(index));
-    }
-
-    private void beginAutoPilot(int index) {
         submit("启动一键托管失败", () -> {
             if (autoPilotActive) {
-                log("一键托管正在运行：" + pilotDisplayName());
+                log("一键托管正在运行：" + autoPilotStatus);
                 return;
             }
-            int safeIndex = Math.max(0, Math.min(index, sessions.length - 1));
-            AccountSession session = sessions[safeIndex];
-            if (session == null) {
-                log("一键托管启动失败：账号槽位未初始化");
-                return;
-            }
-
-            long now = System.currentTimeMillis();
-            pilotQueue.clear();
-            pilotHandledExcelRows.clear();
-            pilotQueue.addAll(buildPilotQueue(safeIndex));
-            pilotQueuePosition = 0;
-            if (pilotQueue.isEmpty()) {
-                autoPilotActive = false;
-                autoPilotStopRequested = false;
-                autoPilotPhase = PILOT_IDLE;
-                String text = "今天可托管账号都已跑完（完成日期为 " + LocalDate.now() + "）";
-                setAutoPilotStatus("今日账号已全部跑完");
-                log("[托管] " + text);
-                PilotLog.append(store.account(safeIndex).displayName(), text);
-                return;
-            }
-            if (!pilotQueue.contains(safeIndex)) {
-                safeIndex = pilotQueue.get(0);
-            }
-            session = sessions[safeIndex];
-            if (session == null) {
-                autoPilotActive = false;
-                autoPilotStopRequested = false;
-                autoPilotPhase = PILOT_IDLE;
-                log("一键托管启动失败：账号槽位未初始化");
-                return;
-            }
-
-            autoPilotIndex = safeIndex;
-            autoPilotStopRequested = false;
-            autoPilotActive = true;
-            autoPilotStartedAt = now;
-            autoPilotPhaseAt = now;
-            autoPilotNextActionAt = now;
-            autoPilotAttempts = 0;
-            autoPilotRestartCount = 0;
-            autoPilotCityRequested = false;
-            nextMissionSnapshotAt = 0L;
-            noMissionStreak = 0;
-            autoPilotPhase = PILOT_OPENING;
-            setAutoPilotStatus("正在打开浏览器");
-            log("[托管] 开始处理 " + store.account(safeIndex).displayName());
-            log("[托管] 自动切号队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
-            PilotLog.append("", "建立托管队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
-            if (pilotQueue.size() <= 1) {
-                log("[托管] 当前先处理 1 个账号；该号保底完成后会重新读取 Excel，自动接力今日未完成账号");
-                PilotLog.append(store.account(safeIndex).displayName(), "当前先处理1个账号；完成后将重读Excel接力未完成账号");
-            } else {
-                setAutoPilotStatus("等待处理队列 1/" + pilotQueue.size());
-            }
-
-            try {
-                session.open(playwright);
-                refreshState(safeIndex);
-                autoPilotPhase = PILOT_WAIT_GAME;
-                autoPilotPhaseAt = System.currentTimeMillis();
-                autoPilotNextActionAt = autoPilotPhaseAt;
-                setAutoPilotStatus("等待登录、选角并进入游戏");
-            } catch (Exception e) {
-                failAutoPilot("打开浏览器失败: " + e.getMessage());
-            }
+            startSinglePilot(Math.max(0, Math.min(index, sessions.length - 1)), System.currentTimeMillis());
         });
     }
 
     public void stopAutoPilot() {
         submit("停止一键托管失败", () -> {
-            if (!autoPilotActive || autoPilotIndex < 0) {
+            if (!autoPilotActive && pilotRunners.isEmpty()) {
                 autoPilotActive = false;
                 autoPilotStopRequested = false;
                 autoPilotPhase = PILOT_IDLE;
                 setAutoPilotStatus("");
                 return;
             }
-            int index = autoPilotIndex;
-            autoPilotStopRequested = true;
-            autoPilotPhase = PILOT_STOPPING;
-            setAutoPilotStatus("正在停止脚本");
-            AccountSession session = sessions[index];
-            if (session != null) {
-                try {
-                    session.stopScriptsIfInGame(false);
-                } catch (Exception ignored) {
+
+            List<Integer> slots = new ArrayList<>();
+            for (PilotState runner : new ArrayList<>(pilotRunners)) {
+                slots.add(runner.slot);
+                AccountSession session = sessions[runner.slot];
+                if (session != null) {
+                    try {
+                        session.stopScriptsIfInGame(false);
+                    } catch (Exception ignored) {
+                    }
                 }
             }
+            boolean bulk = pilotBulkMode;
+            resetPilotRuntime();
             autoPilotActive = false;
             autoPilotStopRequested = false;
             autoPilotPhase = PILOT_IDLE;
             setAutoPilotStatus("已停止（窗口保留）");
-            log("[托管] 已停止 " + store.account(index).displayName() + "，窗口保留");
+            log("[托管] 已停止" + (bulk ? "全托" : "单号托管")
+                    + "，窗口保留：" + slotNames(slots));
         });
     }
 
@@ -838,190 +861,317 @@ public class SessionManager implements AutoCloseable {
         if (!autoPilotActive || autoPilotStopRequested) {
             return;
         }
-        int index = autoPilotIndex;
-        if (index < 0 || index >= sessions.length || sessions[index] == null) {
-            failAutoPilot("托管账号槽位无效");
+
+        long now = System.currentTimeMillis();
+        for (PilotState runner : new ArrayList<>(pilotRunners)) {
+            if (isTerminalPilotPhase(runner.phase)) {
+                continue;
+            }
+            try {
+                pollPilotRunner(runner, now);
+            } catch (Exception e) {
+                failPilotRunner(runner, "托管异常: " + e.getMessage());
+            }
+        }
+
+        if (pilotBulkMode) {
+            advancePilotBatchIfReady(now);
+        } else if (!pilotRunners.isEmpty() && isTerminalPilotPhase(pilotRunners.get(0).phase)) {
+            autoPilotActive = false;
+            autoPilotPhase = PILOT_IDLE;
+        }
+    }
+
+    private void startSinglePilot(int slot, long now) {
+        AccountSession session = sessions[slot];
+        if (session == null) {
+            failGlobalAutoPilot("账号槽位未初始化");
             return;
         }
 
-        AccountSession session = sessions[index];
-        long now = System.currentTimeMillis();
+        resetPilotRuntime();
+        pilotBulkMode = false;
+        autoPilotActive = true;
+        autoPilotStopRequested = false;
+        autoPilotIndex = slot;
+
+        PilotState runner = newPilotRunner(slot, now, PILOT_WAIT_GAME);
+        pilotRunners.add(runner);
         try {
-            switch (autoPilotPhase) {
-                case PILOT_OPENING -> setAutoPilotStatus("正在打开浏览器");
+            session.open(playwright);
+            refreshState(slot);
+            runner.phase = PILOT_WAIT_GAME;
+            runner.phaseAt = System.currentTimeMillis();
+            runner.nextActionAt = runner.phaseAt;
+            runner.status = "等待登录、选角并进入游戏";
+            setAutoPilotStatus(runner.status);
+            log("[托管] 开始单号托管 " + pilotRunnerName(runner));
+            PilotLog.append(pilotRunnerName(runner), "开始单号托管");
+        } catch (Exception e) {
+            failPilotRunner(runner, "打开浏览器失败: " + e.getMessage());
+            autoPilotActive = false;
+        }
+    }
 
-                case PILOT_WAIT_GAME -> {
-                    if (!session.isOpen()) {
-                        failAutoPilot("浏览器窗口已关闭");
-                        return;
-                    }
-                    if (session.isBootstrapped()) {
-                        log("[托管] 游戏环境已就绪 " + pilotDisplayName());
-                        autoPilotPhase = PILOT_ENTER_CITY;
-                        autoPilotPhaseAt = now;
-                        autoPilotNextActionAt = now;
-                        autoPilotAttempts = 0;
-                        autoPilotCityRequested = false;
-                        setAutoPilotStatus("准备进城");
-                    } else if (now - autoPilotStartedAt > PILOT_LOGIN_TIMEOUT_MS) {
-                        failAutoPilot("等待登录/选角/进入游戏超时，请检查账号密码、验证码或网络");
+    private void startPilotBatch(List<ExcelAccount> accounts, long now) {
+        resetPilotRuntime();
+        pilotBulkMode = true;
+        pilotBatchNumber++;
+        autoPilotActive = true;
+        autoPilotStopRequested = false;
+        autoPilotIndex = 0;
+
+        for (int slot = 0; slot < sessions.length; slot++) {
+            try {
+                if (sessions[slot] != null && sessions[slot].isOpen()) {
+                    sessions[slot].close();
+                }
+            } catch (Exception ignored) {
+            }
+            refreshState(slot);
+        }
+
+        StringBuilder rowText = new StringBuilder();
+        for (int i = 0; i < accounts.size(); i++) {
+            ExcelAccount account = accounts.get(i);
+            int slot = i;
+            try {
+                applyExcelAccountToPilotSlot(slot, account);
+                PilotState runner = newPilotRunner(slot, now, PILOT_OPENING);
+                runner.excelRow = account.getRowNumber();
+                pilotRunners.add(runner);
+                if (rowText.length() > 0) {
+                    rowText.append("，");
+                }
+                rowText.append(String.format("%02d=Excel第%d行", slot + 1, account.getRowNumber()));
+            } catch (Exception e) {
+                log("[托管] 写入槽位 " + String.format("%02d", slot + 1)
+                        + " 账号失败: " + e.getMessage());
+                PilotLog.append("", "写入槽位" + (slot + 1) + "失败: " + e.getMessage());
+            }
+        }
+
+        log("[托管] 全托第 " + pilotBatchNumber + " 批启动，本批 "
+                + pilotRunners.size() + " 个账号并发：" + rowText);
+        PilotLog.append("", "全托第" + pilotBatchNumber + "批启动（"
+                + pilotRunners.size() + "个并发）：" + rowText);
+
+        for (PilotState runner : new ArrayList<>(pilotRunners)) {
+            AccountSession session = sessions[runner.slot];
+            try {
+                session.open(playwright);
+                refreshState(runner.slot);
+                runner.phase = PILOT_WAIT_GAME;
+                runner.phaseAt = System.currentTimeMillis();
+                runner.nextActionAt = runner.phaseAt;
+                runner.status = "等待登录、选角并进入游戏";
+            } catch (Exception e) {
+                failPilotRunner(runner, "打开浏览器失败: " + e.getMessage());
+            }
+        }
+        setBulkStatus(now);
+    }
+
+    private PilotState newPilotRunner(int slot, long now, int phase) {
+        PilotState runner = new PilotState();
+        runner.slot = slot;
+        runner.excelRow = store.account(slot).getExcelRow();
+        runner.phase = phase;
+        runner.startedAt = now;
+        runner.phaseAt = now;
+        runner.nextActionAt = now;
+        runner.nextSnapshotAt = 0L;
+        runner.status = "";
+        return runner;
+    }
+
+    private void pollPilotRunner(PilotState runner, long now) {
+        int index = runner.slot;
+        AccountSession session = index >= 0 && index < sessions.length ? sessions[index] : null;
+        if (session == null) {
+            failPilotRunner(runner, "账号槽位无效");
+            return;
+        }
+
+        switch (runner.phase) {
+            case PILOT_OPENING -> runner.status = "正在打开浏览器";
+
+            case PILOT_WAIT_GAME -> {
+                if (!session.isOpen()) {
+                    failPilotRunner(runner, "浏览器窗口已关闭");
+                    return;
+                }
+                if (session.isBootstrapped()) {
+                    log("[托管] 游戏环境已就绪 " + pilotRunnerName(runner));
+                    runner.phase = PILOT_ENTER_CITY;
+                    runner.phaseAt = now;
+                    runner.nextActionAt = now;
+                    runner.attempts = 0;
+                    runner.cityRequested = false;
+                    runner.status = "准备进城";
+                } else if (now - runner.startedAt > PILOT_LOGIN_TIMEOUT_MS) {
+                    failPilotRunner(runner, "等待登录/选角/进入游戏超时，请检查账号密码、验证码或网络");
+                } else {
+                    runner.status = "等待登录/选角/进入游戏（"
+                            + elapsedText(now - runner.startedAt) + "）";
+                }
+            }
+
+            case PILOT_ENTER_CITY -> {
+                if (!session.isOpen()) {
+                    failPilotRunner(runner, "浏览器窗口已关闭");
+                    return;
+                }
+                if (!session.isBootstrapped()) {
+                    if (now - runner.phaseAt > 60_000L) {
+                        failPilotRunner(runner, "游戏脚本注入失败或页面跳转异常");
                     } else {
-                        setAutoPilotStatus("等待登录/选角/进入游戏（"
-                                + elapsedText(now - autoPilotStartedAt) + "）");
+                        runner.status = "等待脚本注入完成";
                     }
+                    return;
                 }
 
-                case PILOT_ENTER_CITY -> {
-                    if (!session.isOpen()) {
-                        failAutoPilot("浏览器窗口已关闭");
-                        return;
-                    }
-                    if (!session.isBootstrapped()) {
-                        if (now - autoPilotPhaseAt > 60_000L) {
-                            failAutoPilot("游戏脚本注入失败或页面跳转异常");
-                        } else {
-                            setAutoPilotStatus("等待脚本注入完成");
-                        }
-                        return;
-                    }
+                boolean inCity = false;
+                try {
+                    inCity = session.isInCity();
+                } catch (Exception ignored) {
+                }
+                if (inCity) {
+                    log("[托管] 已在城内 " + pilotRunnerName(runner));
+                    runner.phase = PILOT_START_AUTO;
+                    runner.phaseAt = now;
+                    runner.nextActionAt = now;
+                    runner.attempts = 0;
+                    runner.status = "准备开启自动任务";
+                    return;
+                }
 
-                    boolean inCity = false;
+                if (!runner.cityRequested) {
                     try {
-                        inCity = session.isInCity();
-                    } catch (Exception ignored) {
-                    }
-                    if (inCity) {
-                        log("[托管] 已在城内 " + pilotDisplayName());
-                        autoPilotPhase = PILOT_START_AUTO;
-                        autoPilotPhaseAt = now;
-                        autoPilotNextActionAt = now;
-                        autoPilotAttempts = 0;
-                        setAutoPilotStatus("准备开启自动任务");
-                        return;
-                    }
-
-                    if (!autoPilotCityRequested) {
-                        try {
-                            session.enterCity(false);
-                            autoPilotCityRequested = true;
-                            autoPilotNextActionAt = now + 3_000L;
-                            setAutoPilotStatus("已请求进城，等待加载");
-                        } catch (Exception e) {
-                            autoPilotAttempts++;
-                            autoPilotNextActionAt = now + 3_000L;
-                            if (now - autoPilotPhaseAt > PILOT_CITY_TIMEOUT_MS) {
-                                failAutoPilot("进城失败: " + e.getMessage());
-                            } else {
-                                setAutoPilotStatus("进城接口未就绪，重试中（" + autoPilotAttempts + "）");
-                            }
+                        session.enterCity(false);
+                        runner.cityRequested = true;
+                        runner.nextActionAt = now + 3_000L;
+                        runner.status = "已请求进城，等待加载";
+                    } catch (Exception e) {
+                        runner.attempts++;
+                        runner.nextActionAt = now + 3_000L;
+                        if (now - runner.phaseAt > PILOT_CITY_TIMEOUT_MS) {
+                            failPilotRunner(runner, "进城失败: " + e.getMessage());
+                        } else {
+                            runner.status = "进城接口未就绪，重试中（" + runner.attempts + "）";
                         }
-                        return;
                     }
-
-                    if (now - autoPilotPhaseAt > PILOT_CITY_TIMEOUT_MS) {
-                        failAutoPilot("进城超时，请确认角色状态或网络");
-                    } else {
-                        setAutoPilotStatus("等待进城加载（"
-                                + elapsedText(now - autoPilotPhaseAt) + "）");
-                    }
+                    return;
                 }
 
-                case PILOT_START_AUTO, PILOT_RUNNING -> {
-                    if (!session.isOpen()) {
-                        failAutoPilot("浏览器窗口已关闭");
-                        return;
-                    }
-                    if (!session.isBootstrapped()) {
-                        if (now - autoPilotPhaseAt > 60_000L) {
-                            failAutoPilot("游戏脚本注入丢失，自动任务无法继续");
-                        } else {
-                            setAutoPilotStatus("等待页面重新注入脚本");
-                        }
-                        return;
-                    }
+                if (now - runner.phaseAt > PILOT_CITY_TIMEOUT_MS) {
+                    failPilotRunner(runner, "进城超时，请确认角色状态或网络");
+                } else {
+                    runner.status = "等待进城加载（" + elapsedText(now - runner.phaseAt) + "）";
+                }
+            }
 
-                    boolean autoOn = (session.scriptFlags() & AccountSession.FLAG_AUTO) != 0;
-                    if (autoPilotPhase == PILOT_START_AUTO) {
-                        if (now >= autoPilotNextActionAt && !autoOn) {
-                            try {
-                                session.startAuto(false);
-                                autoPilotAttempts++;
-                                log("[托管] 已发送自动任务启动指令 " + pilotDisplayName());
-                            } catch (Exception e) {
-                                if (now - autoPilotPhaseAt > PILOT_AUTO_TIMEOUT_MS) {
-                                    failAutoPilot("开启自动任务失败: " + e.getMessage());
-                                    return;
-                                }
+            case PILOT_START_AUTO, PILOT_RUNNING -> {
+                if (!session.isOpen()) {
+                    failPilotRunner(runner, "浏览器窗口已关闭");
+                    return;
+                }
+                if (!session.isBootstrapped()) {
+                    if (now - runner.phaseAt > 60_000L) {
+                        failPilotRunner(runner, "游戏脚本注入丢失，自动任务无法继续");
+                    } else {
+                        runner.status = "等待页面重新注入脚本";
+                    }
+                    return;
+                }
+
+                boolean autoOn = (session.scriptFlags() & AccountSession.FLAG_AUTO) != 0;
+                if (runner.manualAutoOff) {
+                    runner.status = "自动已手动关闭（托管等待中，不强制开启）";
+                    return;
+                }
+
+                if (runner.phase == PILOT_START_AUTO) {
+                    if (now >= runner.nextActionAt && !autoOn) {
+                        try {
+                            session.startAuto(false);
+                            runner.attempts++;
+                            log("[托管] 已发送自动任务启动指令 " + pilotRunnerName(runner));
+                        } catch (Exception e) {
+                            if (now - runner.phaseAt > PILOT_AUTO_TIMEOUT_MS) {
+                                failPilotRunner(runner, "开启自动任务失败: " + e.getMessage());
+                                return;
                             }
-                            autoPilotNextActionAt = now + 3_000L;
                         }
-
-                        if (autoOn) {
-                            autoPilotPhase = PILOT_RUNNING;
-                            autoPilotPhaseAt = now;
-                            autoPilotNextActionAt = now + 10_000L;
-                            autoPilotRestartCount = 0;
-                            // 严格按 3 分钟检查一次；连续 20 次无主线可接/可交，即约 60 分钟保底切号。
-                            nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
-                            log("[托管] 自动任务已开启，进入持续守护 " + pilotDisplayName());
-                        } else if (now - autoPilotPhaseAt > PILOT_AUTO_TIMEOUT_MS) {
-                            failAutoPilot("自动任务开启后未检测到运行状态");
-                        } else {
-                            setAutoPilotStatus("确认自动任务状态（"
-                                    + elapsedText(now - autoPilotPhaseAt) + "）");
-                        }
-                        return;
+                        runner.nextActionAt = now + 3_000L;
                     }
 
                     if (autoOn) {
-                        autoPilotRestartCount = 0;
-                        autoPilotNextActionAt = now + 10_000L;
-                        boolean switched = pollMissionSnapshot(session, now);
-                        if (switched) {
-                            return;
-                        }
-                        String noTaskText = noMissionStreak > 0
-                                ? "，无主线 " + noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
-                                : "";
-                        setAutoPilotStatus("自动任务运行中（已托管 "
-                                + elapsedText(now - autoPilotStartedAt) + noTaskText + "）");
-                    } else if (now < autoPilotNextActionAt) {
-                        setAutoPilotStatus("自动任务状态确认中");
-                    } else if (autoPilotRestartCount >= 3) {
-                        failAutoPilot("自动任务连续停止，守护失败");
+                        runner.phase = PILOT_RUNNING;
+                        runner.phaseAt = now;
+                        runner.nextActionAt = now + 10_000L;
+                        runner.restartCount = 0;
+                        runner.noMissionStreak = 0;
+                        runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+                        log("[托管] 自动任务已开启，进入持续守护 " + pilotRunnerName(runner));
+                    } else if (now - runner.phaseAt > PILOT_AUTO_TIMEOUT_MS) {
+                        failPilotRunner(runner, "自动任务开启后未检测到运行状态");
                     } else {
-                        autoPilotRestartCount++;
-                        log("[托管] 检测到自动任务停止，第 "
-                                + autoPilotRestartCount + " 次重新开启 " + pilotDisplayName());
-                        session.startAuto(false);
-                        autoPilotNextActionAt = now + 10_000L;
-                        setAutoPilotStatus("自动任务断开，正在重启（"
-                                + autoPilotRestartCount + "/3）");
+                        runner.status = "确认自动任务状态（"
+                                + elapsedText(now - runner.phaseAt) + "）";
                     }
+                    return;
                 }
 
-                case PILOT_STOPPING -> setAutoPilotStatus("正在停止脚本");
-                case PILOT_FAILED -> { }
-                default -> {
-                    autoPilotActive = false;
-                    autoPilotPhase = PILOT_IDLE;
+                if (autoOn) {
+                    runner.restartCount = 0;
+                    runner.nextActionAt = now + 10_000L;
+                    boolean completed = pollPilotMission(runner, session, now);
+                    if (completed) {
+                        return;
+                    }
+                    String noTaskText = runner.noMissionStreak > 0
+                            ? "，无主线 " + runner.noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
+                            : "";
+                    runner.status = "自动运行中（" + elapsedText(now - runner.startedAt)
+                            + noTaskText + "）";
+                } else if (now < runner.nextActionAt) {
+                    runner.status = "自动任务状态确认中";
+                } else if (runner.restartCount >= 3) {
+                    failPilotRunner(runner, "自动任务连续停止，守护失败");
+                } else {
+                    runner.restartCount++;
+                    log("[托管] 检测到自动任务停止，第 "
+                            + runner.restartCount + " 次重新开启 " + pilotRunnerName(runner));
+                    session.startAuto(false);
+                    runner.nextActionAt = now + 10_000L;
+                    runner.status = "自动任务断开，正在重启（" + runner.restartCount + "/3）";
                 }
             }
-        } catch (Exception e) {
-            failAutoPilot("托管异常: " + e.getMessage());
+
+            case PILOT_STOPPING -> runner.status = "正在停止脚本";
+            case PILOT_FAILED, PILOT_COMPLETED -> { }
+            default -> failPilotRunner(runner, "未知托管状态");
+        }
+
+        if (pilotBulkMode) {
+            setBulkStatus(now);
+        } else {
+            setAutoPilotStatus(runner.status);
         }
     }
-    private boolean pollMissionSnapshot(AccountSession session, long now) {
-        if (nextMissionSnapshotAt == 0L || now < nextMissionSnapshotAt) {
+
+    private boolean pollPilotMission(PilotState runner, AccountSession session, long now) {
+        if (runner.nextSnapshotAt == 0L || now < runner.nextSnapshotAt) {
             return false;
         }
-        String name = pilotDisplayName();
+        String name = pilotRunnerName(runner);
         try {
             JsonObject snapshot = session.readMissionSnapshot();
             if (!snapshot.has("ok") || !snapshot.get("ok").getAsBoolean()) {
                 String error = snapshot.has("error") && !snapshot.get("error").isJsonNull()
                         ? snapshot.get("error").getAsString() : "未知错误";
-                nextMissionSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
+                runner.nextSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
                 String text = "[任务快照] 读取失败，60秒后重试：" + error;
                 log(text + " " + name);
                 MissionSnapshotLog.append(name, "读取失败：" + error);
@@ -1063,33 +1213,30 @@ public class SessionManager implements AutoCloseable {
             MissionSnapshotLog.append(name, detail.toString());
 
             if (autoAcceptCount > 0 || autoSubmitCount > 0) {
-                if (noMissionStreak > 0) {
+                if (runner.noMissionStreak > 0) {
                     log("[托管] 检测到主线任务，无任务计数已清零 " + name);
                 }
-                noMissionStreak = 0;
-                nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+                runner.noMissionStreak = 0;
+                runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
                 return false;
             }
 
-            noMissionStreak++;
-            log("[托管] 无主线任务计数 " + noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
-                    + "（连续约60分钟无主线可接/可交后切号） " + name);
-            MissionSnapshotLog.append(name, "无主线任务计数 " + noMissionStreak
+            runner.noMissionStreak++;
+            log("[托管] 无主线任务计数 " + runner.noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
+                    + "（每1分钟检测，连续10次无主线可接/可交后完成该号） " + name);
+            MissionSnapshotLog.append(name, "无主线任务计数 " + runner.noMissionStreak
                     + "/" + NO_MISSION_SWITCH_LIMIT);
-            PilotLog.append(name, "无主线任务计数 " + noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT);
-            nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+            PilotLog.append(name, "无主线任务计数 " + runner.noMissionStreak
+                    + "/" + NO_MISSION_SWITCH_LIMIT);
+            runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
 
-            if (noMissionStreak >= NO_MISSION_SWITCH_LIMIT) {
-                log("[托管] 连续 " + NO_MISSION_SWITCH_LIMIT
-                        + " 次无主线可接/可交任务，开始切换下一个账号 " + name);
-                PilotLog.append(name, "连续" + NO_MISSION_SWITCH_LIMIT
-                        + "次无主线可接/可交任务，准备切换下一个账号");
-                return switchToNextPilotAccount(now);
+            if (runner.noMissionStreak >= NO_MISSION_SWITCH_LIMIT) {
+                completePilotRunner(runner);
+                return true;
             }
             return false;
         } catch (Exception e) {
-            // 读取异常不计数，避免网络/页面瞬时异常导致误切号；60 秒后重试。
-            nextMissionSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
+            runner.nextSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
             String text = "[任务快照] 读取异常，60秒后重试：" + e.getMessage();
             log(text + " " + name);
             MissionSnapshotLog.append(name, "读取异常：" + e.getMessage());
@@ -1097,6 +1244,190 @@ public class SessionManager implements AutoCloseable {
         }
     }
 
+    private void completePilotRunner(PilotState runner) {
+        String name = pilotRunnerName(runner);
+        log("[托管] 连续 " + NO_MISSION_SWITCH_LIMIT
+                + " 次无主线可接/可交任务，判定该号已跑完 " + name);
+        PilotLog.append(name, "连续" + NO_MISSION_SWITCH_LIMIT
+                + "次无主线可接/可交任务，判定完成");
+        markPilotAccountFinished(runner.slot);
+        try {
+            sessions[runner.slot].stopScriptsIfInGame(false);
+        } catch (Exception ignored) {
+        }
+        runner.phase = PILOT_COMPLETED;
+        runner.status = "已完成，等待同批其他账号";
+        if (pilotBulkMode) {
+            log("[托管] " + name + " 已完成，等待同批其他账号");
+        } else {
+            setAutoPilotStatus("单号托管完成（窗口保留）");
+        }
+    }
+
+    private void advancePilotBatchIfReady(long now) {
+        if (!pilotBulkMode || pilotRunners.isEmpty()) {
+            return;
+        }
+        for (PilotState runner : pilotRunners) {
+            if (!isTerminalPilotPhase(runner.phase)) {
+                pilotBatchFinishedAt = 0L;
+                setBulkStatus(now);
+                return;
+            }
+        }
+
+        if (pilotBatchFinishedAt == 0L) {
+            pilotBatchFinishedAt = now;
+            log("[托管] 第 " + pilotBatchNumber + " 批全部结束，3 秒后重新读取 Excel 寻找下一批");
+            setBulkStatus(now);
+            return;
+        }
+        if (now - pilotBatchFinishedAt < 3_000L) {
+            return;
+        }
+
+        List<ExcelAccount> accounts;
+        try {
+            accounts = unfinishedExcelAccounts(readExcelAccountsSnapshot());
+        } catch (Exception e) {
+            failGlobalAutoPilot("批次结束后重新读取 Excel 失败: " + e.getMessage());
+            PilotLog.append("", "第" + pilotBatchNumber + "批后读取Excel失败: " + e.getMessage());
+            return;
+        }
+
+        if (accounts.isEmpty()) {
+            for (PilotState runner : pilotRunners) {
+                try {
+                    sessions[runner.slot].stopScriptsIfInGame(false);
+                } catch (Exception ignored) {
+                }
+            }
+            String text = "Excel 今日账号已全部跑完";
+            log("[托管] " + text);
+            PilotLog.append("", "第" + pilotBatchNumber + "批结束：" + text);
+            autoPilotActive = false;
+            autoPilotStopRequested = false;
+            autoPilotPhase = PILOT_IDLE;
+            setAutoPilotStatus(text);
+            pilotRunners.clear();
+            return;
+        }
+
+        if (accounts.size() > PILOT_BATCH_SIZE) {
+            accounts = new ArrayList<>(accounts.subList(0, PILOT_BATCH_SIZE));
+        }
+        startPilotBatch(accounts, now);
+    }
+
+    private List<ExcelAccount> unfinishedExcelAccounts(List<ExcelAccount> accounts) {
+        List<ExcelAccount> result = new ArrayList<>();
+        if (accounts == null) {
+            return result;
+        }
+        for (ExcelAccount account : accounts) {
+            if (account == null || account.isFinishedToday()) {
+                continue;
+            }
+            Channel channel = account.getChannel();
+            boolean valid = channel == Channel.GUANFANG
+                    ? !account.getUsername().isBlank() && !account.getPassword().isBlank()
+                    : !account.getUrl().isBlank();
+            if (valid) {
+                result.add(account);
+            }
+        }
+        return result;
+    }
+
+    private PilotState findPilotRunner(int slot) {
+        for (PilotState runner : pilotRunners) {
+            if (runner.slot == slot) {
+                return runner;
+            }
+        }
+        return null;
+    }
+
+    private boolean isTerminalPilotPhase(int phase) {
+        return phase == PILOT_FAILED || phase == PILOT_COMPLETED;
+    }
+
+    private void failPilotRunner(PilotState runner, String reason) {
+        if (runner == null) {
+            failGlobalAutoPilot(reason);
+            return;
+        }
+        runner.phase = PILOT_FAILED;
+        runner.status = "失败：" + reason;
+        log("[托管] " + pilotRunnerName(runner) + " 失败: " + reason);
+        PilotLog.append(pilotRunnerName(runner), "托管失败：" + reason);
+        if (!pilotBulkMode) {
+            autoPilotActive = false;
+            autoPilotPhase = PILOT_FAILED;
+            setAutoPilotStatus(runner.status);
+        }
+    }
+
+    private void failGlobalAutoPilot(String reason) {
+        autoPilotActive = false;
+        autoPilotStopRequested = false;
+        autoPilotPhase = PILOT_FAILED;
+        setAutoPilotStatus("失败：" + reason);
+        log("[托管] 失败: " + reason);
+        PilotLog.append("", "托管失败：" + reason);
+    }
+
+    private void resetPilotRuntime() {
+        autoPilotIndex = -1;
+        autoPilotStopRequested = false;
+        autoPilotPhase = PILOT_IDLE;
+        autoPilotStartedAt = 0L;
+        autoPilotPhaseAt = 0L;
+        autoPilotNextActionAt = 0L;
+        autoPilotAttempts = 0;
+        autoPilotRestartCount = 0;
+        autoPilotCityRequested = false;
+        nextMissionSnapshotAt = 0L;
+        noMissionStreak = 0;
+        pilotQueue.clear();
+        pilotHandledExcelRows.clear();
+        pilotQueuePosition = 0;
+        pilotRunners.clear();
+        pilotBatchFinishedAt = 0L;
+        setAutoPilotStatus("");
+    }
+
+    private void setBulkStatus(long now) {
+        int active = getActivePilotCount();
+        int finished = getFinishedPilotCount();
+        String suffix = pilotBatchFinishedAt != 0L ? "，准备下一批" : "";
+        setAutoPilotStatus("全托第" + pilotBatchNumber + "批·运行"
+                + active + "/" + pilotRunners.size()
+                + "，结束" + finished + "/" + pilotRunners.size() + suffix);
+    }
+
+    private String pilotRunnerName(PilotState runner) {
+        if (runner == null || runner.slot < 0 || runner.slot >= sessions.length) {
+            return "未知账号";
+        }
+        return store.account(runner.slot).displayName();
+    }
+
+    private static final class PilotState {
+        int slot;
+        int excelRow;
+        int phase;
+        long startedAt;
+        long phaseAt;
+        long nextActionAt;
+        int attempts;
+        int restartCount;
+        boolean cityRequested;
+        long nextSnapshotAt;
+        int noMissionStreak;
+        boolean manualAutoOff;
+        String status = "";
+    }
     private List<Integer> buildPilotQueue(int selected) {
         List<Integer> base = new ArrayList<>();
         if (!lastLaunchedSlots.isEmpty()) {

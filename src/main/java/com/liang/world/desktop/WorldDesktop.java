@@ -160,7 +160,7 @@ public class WorldDesktop extends JFrame {
         panel.add(actionButton("比例", "调整游戏区和辅助栏的宽度比例", this::editRatio));
         panel.add(actionButton("尺寸", "调整 Edge 手机仿真宽×高", this::editSize));
         panel.add(actionButton("缩放", "缩小/放大游戏内画面比例（不受窗口最小宽度限制）", this::editGameScale));
-        panel.add(actionButton("全托", "从导号队列第一个账号开始：自动登录、进城、自动任务，无主线后自动切到下一个账号",
+        panel.add(actionButton("全托", "同时启动Excel中今日未完成账号，最多5个一批；本批全部结束后自动读取下一批",
                 this::startBulkAutoPilot));
         panel.add(actionButton("全前置", "恢复所有窗口尺寸并前置当前账号",
                 () -> manager.bringAllToFront(selectedIndex)));
@@ -250,7 +250,7 @@ public class WorldDesktop extends JFrame {
         syncButton.setBackground(on ? new Color(255, 153, 0) : COLOR_CLOSED);
     }
 
-    // running=绿色高亮；未进入游戏时按钮置灰并禁用，进入游戏但功能没开=普通灰可点。
+    // running=绿色高亮；三个辅助按钮始终可点，未进游戏时由 Manager 给出日志提示。
     private void paintToggle(JButton button, boolean running, boolean available) {
         if (button == null) {
             return;
@@ -281,9 +281,9 @@ public class WorldDesktop extends JFrame {
         refreshSyncButton();
 
         boolean bootstrapped = manager.isAccountBootstrapped(selectedIndex);
-        paintToggle(autoButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_AUTO), bootstrapped);
-        paintToggle(refreshButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_REFRESH), bootstrapped);
-        paintToggle(loopButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_LOOP), bootstrapped);
+        paintToggle(autoButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_AUTO), true);
+        paintToggle(refreshButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_REFRESH), true);
+        paintToggle(loopButton, bootstrapped && manager.isScriptOn(selectedIndex, AccountSession.FLAG_LOOP), true);
         refreshAutoPilotButton();
 
         AccountConfig config = manager.store().account(selectedIndex);
@@ -309,13 +309,15 @@ public class WorldDesktop extends JFrame {
         }
         boolean active = manager.isAutoPilotActive();
         if (active) {
-            int queueSize = manager.getAutoPilotQueueSize();
-            int queuePosition = manager.getAutoPilotQueuePosition();
-            String queueText = queueSize > 1 ? " " + queuePosition + "/" + queueSize : "";
-            pilotButton.setText("停管" + queueText + "·" + String.format("%02d", manager.getAutoPilotIndex() + 1));
+            if (manager.isPilotBulkMode()) {
+                pilotButton.setText("停管 " + manager.getFinishedPilotCount()
+                        + "/" + manager.getAutoPilotQueueSize());
+            } else {
+                pilotButton.setText("停管·" + String.format("%02d", manager.getAutoPilotIndex() + 1));
+            }
             pilotButton.setBackground(new Color(255, 153, 0));
-            pilotButton.setToolTipText("一键托管中。当前阶段：" + manager.getAutoPilotStatus()
-                    + "；点击停止并保留窗口。");
+            pilotButton.setToolTipText("托管中。" + manager.getAutoPilotStatus()
+                    + "；自动/刷怪/跟随仍可手动控制，点击停管会停止整个托管并保留窗口。");
         } else {
             pilotButton.setText("托管");
             pilotButton.setBackground(COLOR_CLOSED);
@@ -341,12 +343,13 @@ public class WorldDesktop extends JFrame {
                 this,
                 "将读取固定 Excel 中今天未完成的账号开始托管。\n"
                 + "请确认 WPS/Excel 已按 Ctrl+S 保存；未保存的完成日期程序读不到。\n"
-                + "当前号连续约60分钟无主线任务后，会重新读取 Excel，自动登录下一个今日未完成账号。是否继续？",
+                + "每1分钟检测一次主线任务，某个号连续10次检测不到可接/可交任务即判定完成；\n"
+                + "本批最多同时启动5个号，5个号全部结束后会重新读取 Excel 打开下一批。是否继续？",
                 "批量托管确认",
                 JOptionPane.OK_CANCEL_OPTION);
         if (choice == JOptionPane.OK_OPTION) {
             manager.startAutoPilotAll();
-            appendLog("开始批量托管：按已保存 Excel 的今日未完成账号接力");
+            appendLog("开始全托：最多5个号一批并发，本批结束后自动读取下一批");
         }
     }
 
