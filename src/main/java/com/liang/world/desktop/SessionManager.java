@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
+import java.time.LocalDate;
 import java.util.Properties;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -474,6 +475,7 @@ public class SessionManager implements AutoCloseable {
                 config.setChannel(channel);
 
                 config.setExcelRow(excelAccount.getRowNumber());
+                config.setFinishDate(excelAccount.getFinishDate());
                 if (channel == Channel.GUANFANG) {
                     config.setCustomUrl("");
                     config.setUsername(excelAccount.getUsername());
@@ -509,6 +511,7 @@ public class SessionManager implements AutoCloseable {
                 unusedConfig.setExcelRow(0);
                 unusedConfig.setUsername("");
                 unusedConfig.setPassword("");
+                unusedConfig.setFinishDate("");
                 try {
                     sessions[i].close();
                     log("已关闭未使用槽位 " + String.format("%02d", i + 1));
@@ -522,6 +525,11 @@ public class SessionManager implements AutoCloseable {
 
             lastLaunchedSlots = launchedSlots;
             store.save();
+            PilotLog.append("", "导号建立自动上号队列（" + launchedSlots.size() + "个）：" + slotNames(launchedSlots));
+            if (launchedSlots.size() <= 1) {
+                log("本次只选择了 1 个账号；如需自动切号，请在导号窗口勾选至少 2 个账号");
+                PilotLog.append("", "本次只选择1个账号，自动托管无下一号可切");
+            }
             if (excelAccounts.size() > ConfigStore.ACCOUNT_COUNT) {
                 log("Excel 中有 " + excelAccounts.size()
                         + " 个账号，最多同时打开 10 个，多余的已忽略");
@@ -671,25 +679,13 @@ public class SessionManager implements AutoCloseable {
                 return;
             }
 
-            int first = -1;
-            if (!lastLaunchedSlots.isEmpty()) {
-                for (Integer slot : lastLaunchedSlots) {
-                    if (slot != null && slot >= 0 && slot < sessions.length) {
-                        first = slot;
-                        break;
-                    }
-                }
-            }
+            int first = findNextUnfinishedPilotSlot();
             if (first < 0) {
-                for (int i = 0; i < sessions.length; i++) {
-                    if (hasPilotLoginConfig(i)) {
-                        first = i;
-                        break;
-                    }
-                }
-            }
-            if (first < 0) {
-                first = Math.max(0, Math.min(0, sessions.length - 1));
+                String text = "今天可托管账号都已跑完（Excel 完成日期为 " + LocalDate.now() + "）";
+                log("[托管] " + text);
+                PilotLog.append("", text);
+                setAutoPilotStatus("今日账号已全部跑完");
+                return;
             }
             beginAutoPilot(first);
         });
@@ -713,6 +709,31 @@ public class SessionManager implements AutoCloseable {
             }
 
             long now = System.currentTimeMillis();
+            pilotQueue.clear();
+            pilotQueue.addAll(buildPilotQueue(safeIndex));
+            pilotQueuePosition = 0;
+            if (pilotQueue.isEmpty()) {
+                autoPilotActive = false;
+                autoPilotStopRequested = false;
+                autoPilotPhase = PILOT_IDLE;
+                String text = "今天可托管账号都已跑完（完成日期为 " + LocalDate.now() + "）";
+                setAutoPilotStatus("今日账号已全部跑完");
+                log("[托管] " + text);
+                PilotLog.append(store.account(safeIndex).displayName(), text);
+                return;
+            }
+            if (!pilotQueue.contains(safeIndex)) {
+                safeIndex = pilotQueue.get(0);
+            }
+            session = sessions[safeIndex];
+            if (session == null) {
+                autoPilotActive = false;
+                autoPilotStopRequested = false;
+                autoPilotPhase = PILOT_IDLE;
+                log("一键托管启动失败：账号槽位未初始化");
+                return;
+            }
+
             autoPilotIndex = safeIndex;
             autoPilotStopRequested = false;
             autoPilotActive = true;
@@ -724,14 +745,15 @@ public class SessionManager implements AutoCloseable {
             autoPilotCityRequested = false;
             nextMissionSnapshotAt = 0L;
             noMissionStreak = 0;
-            pilotQueue.clear();
-            pilotQueue.addAll(buildPilotQueue(safeIndex));
-            pilotQueuePosition = 0;
             autoPilotPhase = PILOT_OPENING;
             setAutoPilotStatus("正在打开浏览器");
             log("[托管] 开始处理 " + store.account(safeIndex).displayName());
             log("[托管] 自动切号队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
-            if (pilotQueue.size() > 1) {
+            PilotLog.append("", "建立托管队列（" + pilotQueue.size() + "个）：" + pilotQueueText());
+            if (pilotQueue.size() <= 1) {
+                log("[托管] 当前队列只有 1 个今日未完成账号；保底后会写入完成日期并结束托管");
+                PilotLog.append(store.account(safeIndex).displayName(), "队列只有1个今日未完成账号，保底后将写入完成日期并结束托管");
+            } else {
                 setAutoPilotStatus("等待处理队列 1/" + pilotQueue.size());
             }
 
@@ -1018,11 +1040,14 @@ public class SessionManager implements AutoCloseable {
                     + "（连续约60分钟无主线可接/可交后切号） " + name);
             MissionSnapshotLog.append(name, "无主线任务计数 " + noMissionStreak
                     + "/" + NO_MISSION_SWITCH_LIMIT);
+            PilotLog.append(name, "无主线任务计数 " + noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT);
             nextMissionSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
 
             if (noMissionStreak >= NO_MISSION_SWITCH_LIMIT) {
                 log("[托管] 连续 " + NO_MISSION_SWITCH_LIMIT
                         + " 次无主线可接/可交任务，开始切换下一个账号 " + name);
+                PilotLog.append(name, "连续" + NO_MISSION_SWITCH_LIMIT
+                        + "次无主线可接/可交任务，准备切换下一个账号");
                 return switchToNextPilotAccount(now);
             }
             return false;
@@ -1038,29 +1063,60 @@ public class SessionManager implements AutoCloseable {
 
     private List<Integer> buildPilotQueue(int selected) {
         List<Integer> base = new ArrayList<>();
-        if (!lastLaunchedSlots.isEmpty() && lastLaunchedSlots.contains(selected)) {
+        if (!lastLaunchedSlots.isEmpty()) {
             for (Integer slot : lastLaunchedSlots) {
-                if (slot != null && slot >= 0 && slot < sessions.length && !base.contains(slot)) {
+                if (slot != null && slot >= 0 && slot < sessions.length
+                        && hasPilotLoginConfig(slot) && !isPilotFinishedToday(slot)
+                        && !base.contains(slot)) {
                     base.add(slot);
                 }
             }
-        } else {
+        }
+
+        if (base.isEmpty()) {
             for (int i = 0; i < sessions.length; i++) {
-                if (hasPilotLoginConfig(i)) {
+                if (hasPilotLoginConfig(i) && !isPilotFinishedToday(i)) {
                     base.add(i);
                 }
-            }
-            if (!base.contains(selected)) {
-                base.add(0, selected);
             }
         }
 
         int start = base.indexOf(selected);
-        if (start < 0) start = 0;
+        if (start < 0) {
+            start = 0;
+        }
         List<Integer> queue = new ArrayList<>();
+        if (base.isEmpty()) {
+            return queue;
+        }
         queue.addAll(base.subList(start, base.size()));
         queue.addAll(base.subList(0, start));
         return queue;
+    }
+
+    private int findNextUnfinishedPilotSlot() {
+        if (!lastLaunchedSlots.isEmpty()) {
+            for (Integer slot : lastLaunchedSlots) {
+                if (slot != null && slot >= 0 && slot < sessions.length
+                        && hasPilotLoginConfig(slot) && !isPilotFinishedToday(slot)) {
+                    return slot;
+                }
+            }
+        }
+        for (int i = 0; i < sessions.length; i++) {
+            if (hasPilotLoginConfig(i) && !isPilotFinishedToday(i)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private boolean isPilotFinishedToday(int index) {
+        try {
+            return ExcelAccount.isDateToday(store.account(index).getFinishDate());
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private boolean hasPilotLoginConfig(int index) {
@@ -1074,8 +1130,12 @@ public class SessionManager implements AutoCloseable {
     }
 
     private String pilotQueueText() {
+        return slotNames(pilotQueue);
+    }
+
+    private String slotNames(List<Integer> slots) {
         List<String> names = new ArrayList<>();
-        for (Integer slot : pilotQueue) {
+        for (Integer slot : slots) {
             if (slot != null && slot >= 0 && slot < sessions.length) {
                 names.add(store.account(slot).displayName());
             }
@@ -1088,9 +1148,14 @@ public class SessionManager implements AutoCloseable {
         int nextPosition = pilotQueuePosition + 1;
         AccountSession oldSession = oldIndex >= 0 && oldIndex < sessions.length
                 ? sessions[oldIndex] : null;
+        String oldName = oldIndex >= 0 && oldIndex < sessions.length
+                ? store.account(oldIndex).displayName() : "未知账号";
+
+        markPilotAccountFinished(oldIndex);
 
         if (nextPosition >= pilotQueue.size()) {
             if (oldSession != null) {
+                PilotLog.append(oldName, "队列最后一个账号跑完，停止脚本并保留窗口");
                 try {
                     oldSession.stopScriptsIfInGame(false);
                 } catch (Exception ignored) {
@@ -1101,10 +1166,12 @@ public class SessionManager implements AutoCloseable {
             autoPilotPhase = PILOT_IDLE;
             setAutoPilotStatus("队列账号已全部处理完成");
             log("[托管] 队列账号已全部处理完成");
+            PilotLog.append(oldName, "队列账号已全部处理完成");
             return true;
         }
 
         if (oldSession != null) {
+            PilotLog.append(oldName, "保底无任务，停止脚本并关闭当前账号");
             try {
                 oldSession.stopScriptsIfInGame(false);
             } catch (Exception ignored) {
@@ -1118,6 +1185,7 @@ public class SessionManager implements AutoCloseable {
 
         int nextIndex = pilotQueue.get(nextPosition);
         if (nextIndex < 0 || nextIndex >= sessions.length || sessions[nextIndex] == null) {
+            PilotLog.append(oldName, "切号失败：目标槽位无效");
             failAutoPilot("切号目标槽位无效");
             return true;
         }
@@ -1144,11 +1212,40 @@ public class SessionManager implements AutoCloseable {
             autoPilotPhaseAt = System.currentTimeMillis();
             autoPilotNextActionAt = autoPilotPhaseAt;
             setAutoPilotStatus("等待登录、选角并进入游戏");
-            log("[托管] 已切换到下一个账号，开始处理 " + pilotDisplayName());
+            String nextName = pilotDisplayName();
+            log("[托管] 已切换到下一个账号，开始处理 " + nextName);
+            PilotLog.append(nextName, "已切换到队列第 " + (nextPosition + 1)
+                    + "/" + pilotQueue.size() + " 个账号，等待登录、选角并进入游戏");
         } catch (Exception e) {
+            PilotLog.append(oldName, "切换账号打开失败: " + e.getMessage());
             failAutoPilot("切换账号打开失败: " + e.getMessage());
         }
         return true;
+    }
+
+    private void markPilotAccountFinished(int index) {
+        if (index < 0 || index >= sessions.length) {
+            return;
+        }
+        AccountConfig config = store.account(index);
+        String today = LocalDate.now().toString();
+        String name = config.displayName();
+        config.setFinishDate(today);
+        try {
+            store.save();
+        } catch (Exception e) {
+            log("[托管] 保存本地完成日期失败: " + e.getMessage());
+        }
+        try {
+            Path excelFile = dataDir.resolve("账号.xlsx");
+            ExcelAccountWriter.markAccountFinished(excelFile, config, today);
+            log("[托管] 已写入今日完成日期 " + today + " " + name);
+            PilotLog.append(name, "已写入今日完成日期 " + today);
+        } catch (Exception e) {
+            String text = "写入 Excel 完成日期失败（不影响切号）: " + e.getMessage();
+            log("[托管] " + text + " " + name);
+            PilotLog.append(name, text);
+        }
     }
 
     private static int optionalInt(JsonObject obj, String key) {
@@ -1198,6 +1295,7 @@ public class SessionManager implements AutoCloseable {
         autoPilotPhase = PILOT_FAILED;
         setAutoPilotStatus("失败：" + reason);
         log("[托管] " + name + " 失败: " + reason);
+        PilotLog.append(name, "托管失败：" + reason);
     }
 
     private String pilotDisplayName() {

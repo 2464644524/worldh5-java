@@ -11,6 +11,7 @@ public class AccountConfig {
     private boolean autoReward = true;
     private boolean autoClearBag = false;
     private int excelRow = 0;
+    private String finishDate = "";
 
     public AccountConfig() {
     }
@@ -98,6 +99,14 @@ public class AccountConfig {
 
     public void setExcelRow(int excelRow) {
         this.excelRow = excelRow;
+    }
+
+    public String getFinishDate() {
+        return finishDate;
+    }
+
+    public void setFinishDate(String finishDate) {
+        this.finishDate = finishDate == null ? "" : finishDate.trim();
     }
 
     public String startupUrl() {

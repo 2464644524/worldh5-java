@@ -9,6 +9,7 @@ import org.apache.poi.ss.usermodel.WorkbookFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.LocalDate;
 import java.util.Locale;
 
 /**
@@ -34,11 +35,7 @@ public final class ExcelAccountWriter {
         int rowNumber;
         try (Workbook workbook = WorkbookFactory.create(file.toFile())) {
             Sheet sheet = workbook.getSheetAt(0);
-            Header header = findHeader(sheet);
-            if (header == null) {
-                throw new IllegalStateException("账号表缺少表头：渠道、链接、账号、密码、备注");
-            }
-
+            Header header = findOrCreateHeader(sheet);
             rowNumber = locateRow(sheet, header, config);
             Row row = sheet.getRow(rowNumber);
             boolean newRow = row == null;
@@ -68,13 +65,51 @@ public final class ExcelAccountWriter {
             }
         }
 
+        replaceWorkbook(file, temp);
+        return rowNumber + 1; // 返回 1 基行号
+    }
+
+    public static int markAccountFinished(Path file, AccountConfig config, String date) throws Exception {
+        if (file == null) {
+            throw new IllegalArgumentException("账号表路径为空");
+        }
+        if (!Files.isRegularFile(file)) {
+            ExcelAccountReader.writeTemplate(file);
+        }
+        String finishDate = date == null || date.isBlank() ? LocalDate.now().toString() : date.trim();
+
+        Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+        int rowNumber;
+        try (Workbook workbook = WorkbookFactory.create(file.toFile())) {
+            Sheet sheet = workbook.getSheetAt(0);
+            Header header = findOrCreateHeader(sheet);
+            if (header.finishDateCol < 0) {
+                throw new IllegalStateException("账号表缺少完成日期列");
+            }
+            rowNumber = locateRow(sheet, header, config);
+            Row row = sheet.getRow(rowNumber);
+            if (row == null) {
+                row = sheet.createRow(rowNumber);
+            }
+            setCell(row, header.finishDateCol, finishDate);
+            try (var out = Files.newOutputStream(temp)) {
+                workbook.write(out);
+            }
+        }
+        replaceWorkbook(file, temp);
+        return rowNumber + 1;
+    }
+
+    private static void replaceWorkbook(Path file, Path temp) {
         try {
             Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
         } catch (Exception e) {
-            Files.deleteIfExists(temp);
+            try {
+                Files.deleteIfExists(temp);
+            } catch (Exception ignored) {
+            }
             throw new IllegalStateException("写入账号表失败，请先关闭正在打开的 Excel：" + e.getMessage(), e);
         }
-        return rowNumber + 1; // 返回 1 基行号
     }
 
     private static String excelChannelName(Channel channel) {
@@ -169,6 +204,26 @@ public final class ExcelAccountWriter {
         }
     }
 
+    private static Header findOrCreateHeader(Sheet sheet) {
+        Header header = findHeader(sheet);
+        if (header == null) {
+            throw new IllegalStateException("账号表缺少表头：渠道、链接、账号、密码、备注");
+        }
+        if (header.finishDateCol >= 0) {
+            return header;
+        }
+
+        Row headerRow = sheet.getRow(header.rowNumber);
+        if (headerRow == null) {
+            headerRow = sheet.createRow(header.rowNumber);
+        }
+        int nextCol = Math.max(5, Math.max(headerRow.getLastCellNum(), 0));
+        headerRow.createCell(nextCol).setCellValue("完成日期");
+        sheet.setColumnWidth(nextCol, 14 * 256);
+        header.finishDateCol = nextCol;
+        return header;
+    }
+
     private static Header findHeader(Sheet sheet) {
         int limit = Math.min(sheet.getLastRowNum(), MAX_HEADER_SCAN_ROWS - 1);
         for (int r = 0; r <= limit; r++) {
@@ -200,6 +255,10 @@ public final class ExcelAccountWriter {
                 } else if (h.titleCol < 0 && (text.equals("备注") || text.equals("名称")
                         || text.equals("标记"))) {
                     h.titleCol = c;
+                } else if (h.finishDateCol < 0 && (text.equals("完成日期")
+                        || text.equals("跑完日期") || text.equals("完成时间")
+                        || text.equals("跑完时间") || text.equals("最后完成"))) {
+                    h.finishDateCol = c;
                 }
             }
             if (h.channelCol >= 0 || h.urlCol >= 0 || h.accountCol >= 0) {
@@ -226,5 +285,6 @@ public final class ExcelAccountWriter {
         private int accountCol = -1;
         private int passwordCol = -1;
         private int titleCol = -1;
+        private int finishDateCol = -1;
     }
 }

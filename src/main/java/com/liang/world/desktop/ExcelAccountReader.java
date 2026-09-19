@@ -4,6 +4,7 @@ import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
 import org.apache.poi.ss.usermodel.FormulaEvaluator;
+import org.apache.poi.ss.usermodel.Hyperlink;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
@@ -66,10 +67,10 @@ public final class ExcelAccountReader {
         try (XSSFWorkbook workbook = new XSSFWorkbook()) {
             Sheet sheet = workbook.createSheet("账号");
             Row header = sheet.createRow(0);
-            String[] titles = {"渠道", "链接", "账号", "密码", "备注"};
+            String[] titles = {"渠道", "链接", "账号", "密码", "备注", "完成日期"};
             for (int i = 0; i < titles.length; i++) {
                 header.createCell(i).setCellValue(titles[i]);
-                sheet.setColumnWidth(i, (i == 1 ? 58 : 18) * 256);
+                sheet.setColumnWidth(i, (i == 1 ? 58 : i == 5 ? 14 : 18) * 256);
             }
             try (var output = Files.newOutputStream(file)) {
                 workbook.write(output);
@@ -101,7 +102,8 @@ public final class ExcelAccountReader {
                         urlHeaderScore(header),
                         accountHeaderScore(header),
                         passwordHeaderScore(header),
-                        titleHeaderScore(header));
+                        titleHeaderScore(header),
+                        finishDateHeaderScore(header));
             }
 
             if (scores.isUsableHeader()) {
@@ -129,8 +131,10 @@ public final class ExcelAccountReader {
             String username = value(row, header.accountCol, formatter, evaluator);
             String password = value(row, header.passwordCol, formatter, evaluator);
             String title = value(row, header.titleCol, formatter, evaluator);
+            String finishDate = value(row, header.finishDateCol, formatter, evaluator);
 
-            ExcelAccount account = buildAccount(rowIndex + 1, username, password, title, channelText, url);
+            ExcelAccount account = buildAccount(rowIndex + 1, username, password, title,
+                    channelText, url, finishDate);
             if (account != null) {
                 accounts.add(account);
             }
@@ -139,14 +143,16 @@ public final class ExcelAccountReader {
     }
 
     private static ExcelAccount buildAccount(int rowNumber, String username, String password,
-                                             String title, String channelText, String url) {
+                                             String title, String channelText, String url,
+                                             String finishDate) {
         boolean allBlank = isBlank(channelText) && isBlank(url) && isBlank(username)
-                && isBlank(password) && isBlank(title);
+                && isBlank(password) && isBlank(title) && isBlank(finishDate);
         if (allBlank) {
             return null;
         }
 
-        ExcelAccount candidate = new ExcelAccount(rowNumber, username, password, title, channelText, url);
+        ExcelAccount candidate = new ExcelAccount(rowNumber, username, password, title,
+                channelText, url, finishDate);
         Channel channel = candidate.getChannel();
         if (channel == Channel.GUANFANG) {
             if (isBlank(username) || isBlank(password)) {
@@ -244,6 +250,21 @@ public final class ExcelAccountReader {
         return -1;
     }
 
+    private static int finishDateHeaderScore(String header) {
+        if (header.equals("完成日期") || header.equals("跑完日期") || header.equals("完成时间")
+                || header.equals("跑完时间") || header.equals("最后完成") || header.equals("完成日")) {
+            return 100;
+        }
+        if (header.contains("完成日期") || header.contains("跑完日期")
+                || header.contains("完成时间") || header.contains("最后完成")) {
+            return 80;
+        }
+        if (header.equals("date") || header.equals("finishdate") || header.equals("completedate")) {
+            return 70;
+        }
+        return -1;
+    }
+
     private static String cellValue(Cell cell, DataFormatter formatter, FormulaEvaluator evaluator) {
         if (cell == null) {
             return "";
@@ -267,14 +288,39 @@ public final class ExcelAccountReader {
             }
 
             String value = formatter.formatCellValue(cell, evaluator);
+            value = withHyperlinkFallback(cell, value);
             return value == null ? "" : value.trim();
         } catch (Exception e) {
             try {
                 String value = formatter.formatCellValue(cell);
+                value = withHyperlinkFallback(cell, value);
                 return value == null ? "" : value.trim();
             } catch (Exception ignored) {
+                return hyperlinkAddress(cell);
+            }
+        }
+    }
+
+    private static String withHyperlinkFallback(Cell cell, String value) {
+        if (value != null && !value.isBlank()) {
+            return value;
+        }
+        return hyperlinkAddress(cell);
+    }
+
+    private static String hyperlinkAddress(Cell cell) {
+        try {
+            Hyperlink hyperlink = cell == null ? null : cell.getHyperlink();
+            if (hyperlink == null) {
                 return "";
             }
+            String address = hyperlink.getAddress();
+            if (address == null || address.isBlank()) {
+                address = hyperlink.getLabel();
+            }
+            return address == null ? "" : address.trim();
+        } catch (Exception ignored) {
+            return "";
         }
     }
 
@@ -301,7 +347,8 @@ public final class ExcelAccountReader {
                         urlHeaderScore(value),
                         accountHeaderScore(value),
                         passwordHeaderScore(value),
-                        titleHeaderScore(value));
+                        titleHeaderScore(value),
+                        finishDateHeaderScore(value));
             }
             if (scores.isUsableHeader()) {
                 header = scores.toHeaderLocation(rowIndex);
@@ -320,7 +367,8 @@ public final class ExcelAccountReader {
                     getCsvValue(row, header.passwordCol),
                     getCsvValue(row, header.titleCol),
                     getCsvValue(row, header.channelCol),
-                    getCsvValue(row, header.urlCol));
+                    getCsvValue(row, header.urlCol),
+                    getCsvValue(row, header.finishDateCol));
             if (account != null) {
                 accounts.add(account);
             }
@@ -393,7 +441,8 @@ public final class ExcelAccountReader {
     }
 
     private record HeaderLocation(int rowNumber, int channelCol, int urlCol,
-                                  int accountCol, int passwordCol, int titleCol) {
+                                  int accountCol, int passwordCol, int titleCol,
+                                  int finishDateCol) {
     }
 
     private static final class Scores {
@@ -402,14 +451,16 @@ public final class ExcelAccountReader {
         private int accountCol = -1;
         private int passwordCol = -1;
         private int titleCol = -1;
+        private int finishDateCol = -1;
         private int channelScore = -1;
         private int urlScore = -1;
         private int accountScore = -1;
         private int passwordScore = -1;
         private int titleScore = -1;
+        private int finishDateScore = -1;
 
         private void consider(int col, String header, int channel, int url,
-                              int account, int password, int title) {
+                              int account, int password, int title, int finishDate) {
             if (channel > channelScore) {
                 channelScore = channel;
                 channelCol = col;
@@ -430,6 +481,10 @@ public final class ExcelAccountReader {
                 titleScore = title;
                 titleCol = col;
             }
+            if (finishDate > finishDateScore) {
+                finishDateScore = finishDate;
+                finishDateCol = col;
+            }
         }
 
         private boolean isUsableHeader() {
@@ -442,12 +497,12 @@ public final class ExcelAccountReader {
         private int totalScore() {
             return Math.max(channelScore, 0) + Math.max(urlScore, 0)
                     + Math.max(accountScore, 0) + Math.max(passwordScore, 0)
-                    + Math.max(titleScore, 0);
+                    + Math.max(titleScore, 0) + Math.max(finishDateScore, 0);
         }
 
         private HeaderLocation toHeaderLocation(int rowNumber) {
             return new HeaderLocation(rowNumber, channelCol, urlCol,
-                    accountCol, passwordCol, titleCol);
+                    accountCol, passwordCol, titleCol, finishDateCol);
         }
     }
 }

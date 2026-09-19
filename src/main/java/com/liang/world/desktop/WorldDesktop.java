@@ -505,8 +505,9 @@ public class WorldDesktop extends JFrame {
         table.getColumnModel().getColumn(1).setMaxWidth(48);
         table.getColumnModel().getColumn(2).setMaxWidth(65);
         table.getColumnModel().getColumn(3).setPreferredWidth(130);
-        table.getColumnModel().getColumn(4).setPreferredWidth(360);
+        table.getColumnModel().getColumn(4).setPreferredWidth(320);
         table.getColumnModel().getColumn(5).setMaxWidth(68);
+        table.getColumnModel().getColumn(6).setMaxWidth(105);
 
         JLabel countLabel = new JLabel();
         Runnable updateCount = () -> countLabel.setText(
@@ -542,7 +543,7 @@ public class WorldDesktop extends JFrame {
         buttons.add(loginButton);
         root.add(buttons, BorderLayout.SOUTH);
 
-        selectFirstButton.addActionListener(e -> tableModel.selectFirst(ConfigStore.ACCOUNT_COUNT));
+        selectFirstButton.addActionListener(e -> tableModel.selectUnfinished(ConfigStore.ACCOUNT_COUNT));
         clearButton.addActionListener(e -> tableModel.clearSelection());
         cancelButton.addActionListener(e -> dialog.dispose());
         loginButton.addActionListener(e -> {
@@ -590,7 +591,7 @@ public class WorldDesktop extends JFrame {
         private ExcelAccountTableModel(List<ExcelAccount> accounts) {
             this.accounts = new ArrayList<>(accounts);
             this.selected = new boolean[this.accounts.size()];
-            selectFirst(ConfigStore.ACCOUNT_COUNT);
+            selectUnfinished(ConfigStore.ACCOUNT_COUNT);
         }
 
         @Override
@@ -628,6 +629,9 @@ public class WorldDesktop extends JFrame {
                 case 3 -> account.getTitle();
                 case 4 -> account.isOfficialAccountLogin() ? account.getUsername() : account.getUrl();
                 case 5 -> String.valueOf(account.getRowNumber());
+                case 6 -> account.isFinishedToday()
+                        ? (account.getFinishDate().isBlank() ? "今日已完成" : account.getFinishDate() + " 已完成")
+                        : account.getFinishDate();
                 default -> "";
             };
         }
@@ -644,11 +648,25 @@ public class WorldDesktop extends JFrame {
             }
         }
 
-        private void selectFirst(int count) {
+        private void selectUnfinished(int count) {
+            int chosen = 0;
             for (int i = 0; i < selected.length; i++) {
-                selected[i] = i < count;
+                selected[i] = chosen < count && !accounts.get(i).isFinishedToday();
+                if (selected[i]) {
+                    chosen++;
+                }
             }
             fireTableDataChanged();
+        }
+
+        private int unfinishedCount() {
+            int count = 0;
+            for (ExcelAccount account : accounts) {
+                if (!account.isFinishedToday()) {
+                    count++;
+                }
+            }
+            return count;
         }
 
         private void clearSelection() {
