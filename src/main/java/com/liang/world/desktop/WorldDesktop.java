@@ -156,7 +156,7 @@ public class WorldDesktop extends JFrame {
         panel.add(refreshButton);
         loopButton = toggleButton("跟随", "跟随队长/自动确认押镖（再点一次关闭）", () -> manager.toggleLoop(selectedIndex));
         panel.add(loopButton);
-        panel.add(actionButton("停止", "停止当前账号脚本；托管中会自动暂停，之后可点恢复", () -> manager.stopScripts(selectedIndex)));
+        panel.add(actionButton("停止", "全托中只暂停当前账号，其他账号继续；点当前账号自动即可恢复", () -> manager.stopScripts(selectedIndex)));
         panel.add(actionButton("进城", "执行进城", () -> manager.enterCity(selectedIndex)));
         panel.add(actionButton("微端", "领取微端奖励", () -> manager.drawMicroReward(selectedIndex)));
         panel.add(actionButton("清包", "立即清理一次背包垃圾（规则同自动清背包，日志回报出售件数）", () -> manager.clearBagNow(selectedIndex)));
@@ -183,7 +183,7 @@ public class WorldDesktop extends JFrame {
                 () -> manager.startRefreshAll(selectedIndex)));
         panel.add(actionButton("全跟随", "对所有已进入游戏的账号开启跟随",
                 () -> manager.startLoopAll(selectedIndex)));
-        panel.add(actionButton("全停止", "停止所有脚本；托管中会自动暂停，之后可点恢复",
+        panel.add(actionButton("全停止", "停止所有账号并暂停整个全托；之后点托管旁的恢复继续",
                 () -> manager.stopAllScripts(selectedIndex)));
         panel.add(actionButton("全进城", "对所有已进入游戏的账号执行进城",
                 () -> manager.enterCityAll(selectedIndex)));

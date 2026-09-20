@@ -63,6 +63,7 @@ public class SessionManager implements AutoCloseable {
     private static final long PILOT_OPEN_TIMEOUT_MS = 90_000L;
     private static final long PILOT_LOGIN_TIMEOUT_MS = 10 * 60_000L;
     private static final long PILOT_CITY_TIMEOUT_MS = 60_000L;
+    private static final int PILOT_CITY_MAX_ATTEMPTS = 5;
     private static final long PILOT_AUTO_TIMEOUT_MS = 30_000L;
     private static final long MISSION_SNAPSHOT_INTERVAL_MS = 60_000L;
     private static final long MISSION_SNAPSHOT_RETRY_MS = 60_000L;
@@ -430,6 +431,14 @@ public class SessionManager implements AutoCloseable {
         // 同步手势冲刷：固定节奏把“边界事件 + 最新一帧移动”广播出去，多余 move 直接合并丢弃。
         browserExecutor.scheduleWithFixedDelay(this::flushSyncEvents, 1, 20, TimeUnit.MILLISECONDS);
         log("控制台已启动");
+
+        // 专用启动脚本 run-auto.cmd 会设置该环境变量，用于异常重启后自动恢复全托。
+        if ("1".equals(System.getenv("WORLD_AUTO_PILOT"))) {
+            browserExecutor.schedule(() -> {
+                log("[托管] 检测到自动恢复启动，1 秒后自动开始全托");
+                startAutoPilotAll();
+            }, 1, TimeUnit.SECONDS);
+        }
     }
 
     public void openAccount(int index) {
@@ -583,11 +592,22 @@ public class SessionManager implements AutoCloseable {
             session.startAuto();
             PilotState runner = findPilotRunner(index);
             if (runner != null) {
+                runner.runnerPaused = false;
                 runner.manualAutoOff = false;
                 runner.restartCount = 0;
                 runner.noMissionStreak = 0;
+                runner.runningSince = System.currentTimeMillis();
+                runner.lastProgressAt = runner.runningSince;
+                runner.lastMissionEventAt = 0L;
+                runner.lastMissionSignature = "";
+                runner.lastActivitySignature = "";
+                runner.stuckLoggedAt = 0L;
+                runner.phase = PILOT_START_AUTO;
+                runner.phaseAt = System.currentTimeMillis();
+                runner.nextActionAt = System.currentTimeMillis();
                 runner.nextSnapshotAt = System.currentTimeMillis() + MISSION_SNAPSHOT_INTERVAL_MS;
-                runner.status = "自动运行中（手动开启）";
+                runner.status = "自动运行中（手动恢复该号）";
+                if (pilotBulkMode) log("[托管] 已恢复单号托管 " + pilotRunnerName(runner) + "，其他账号不受影响");
             }
         });
     }
@@ -613,8 +633,23 @@ public class SessionManager implements AutoCloseable {
                 log("请先打开账号 " + String.format("%02d", index + 1));
                 return;
             }
-            // 托管中手动点“停止”，视为要接手操作：先暂停整个托管，避免下一秒又自动开脚本/进城/切号。
-            if (autoPilotActive && !autoPilotPaused) {
+
+            PilotState runner = findPilotRunner(index);
+            if (autoPilotActive && !autoPilotPaused && runner != null && !isTerminalPilotPhase(runner.phase)) {
+                if (pilotBulkMode) {
+                    runner.runnerPaused = true;
+                    runner.manualAutoOff = true;
+                    runner.status = "该号已手动暂停，其他账号继续托管";
+                    try {
+                        session.stopScriptsIfInGame(false);
+                    } catch (Exception ignored) {
+                    }
+                    String text = "[托管] 已单独暂停 " + pilotRunnerName(runner) + "，其他账号继续运行";
+                    log(text);
+                    PilotLog.append(pilotRunnerName(runner), "单独暂停，不影响其他账号");
+                    setBulkStatus(System.currentTimeMillis());
+                    return;
+                }
                 pauseAutoPilot("手动停止 " + store.account(index).displayName() + "，已暂停托管");
             }
             session.stopScripts();
@@ -648,21 +683,30 @@ public class SessionManager implements AutoCloseable {
             if ((session.scriptFlags() & AccountSession.FLAG_AUTO) != 0) {
                 session.stopAuto();
                 if (runner != null) {
+                    runner.runnerPaused = pilotBulkMode;
                     runner.manualAutoOff = true;
-                    runner.status = "自动已手动关闭（托管等待中，不强制开启）";
-                    log("[托管] 检测到手动关闭自动，暂停该号自动守护 "
-                            + store.account(index).displayName());
+                    runner.status = pilotBulkMode ? "该号自动已关闭，其他账号继续托管" : "自动已手动关闭（托管等待中）";
+                    log("[托管] 检测到手动关闭自动，仅暂停该号守护 " + store.account(index).displayName());
                 }
             } else {
                 session.startAuto(false);
                 if (runner != null) {
+                    runner.runnerPaused = false;
                     runner.manualAutoOff = false;
                     runner.restartCount = 0;
                     runner.noMissionStreak = 0;
+                    runner.runningSince = System.currentTimeMillis();
+                    runner.lastProgressAt = runner.runningSince;
+                    runner.lastMissionEventAt = 0L;
+                    runner.lastMissionSignature = "";
+                    runner.lastActivitySignature = "";
+                    runner.stuckLoggedAt = 0L;
+                    runner.phase = PILOT_START_AUTO;
+                    runner.phaseAt = System.currentTimeMillis();
+                    runner.nextActionAt = System.currentTimeMillis();
                     runner.nextSnapshotAt = System.currentTimeMillis() + MISSION_SNAPSHOT_INTERVAL_MS;
-                    runner.status = "自动运行中（手动开启）";
-                    log("[托管] 检测到手动开启自动，恢复该号托管守护 "
-                            + store.account(index).displayName());
+                    runner.status = "自动运行中（手动恢复该号）";
+                    log("[托管] 检测到手动开启自动，恢复该号托管守护 " + store.account(index).displayName());
                 }
             }
         });
@@ -705,7 +749,28 @@ public class SessionManager implements AutoCloseable {
     }
 
     public void stopAllScripts(int frontIndex) {
-        runOnBootstrapped("批量停止脚本", session -> session.stopScripts(false), frontIndex);
+        submit("批量停止脚本失败", () -> {
+            if (autoPilotActive && !autoPilotPaused) {
+                pauseAutoPilot("手动全停止，已暂停整个托管");
+            }
+            int success = 0;
+            int skipped = 0;
+            for (int i = 0; i < sessions.length; i++) {
+                AccountSession session = sessions[i];
+                try {
+                    if (session != null && session.isOpen() && session.isBootstrapped()) {
+                        session.stopScripts(false);
+                        success++;
+                    } else {
+                        skipped++;
+                    }
+                } catch (Exception e) {
+                    skipped++;
+                }
+            }
+            if (success > 0) sessions[Math.max(0, Math.min(frontIndex, sessions.length - 1))].bringToFront();
+            log("全停止完成：已停止 " + success + " 个，未进入游戏跳过 " + skipped + " 个");
+        });
     }
 
     public void enterCityAll(int frontIndex) {
@@ -750,6 +815,7 @@ public class SessionManager implements AutoCloseable {
                     continue;
                 }
                 runner.manualAutoOff = false;
+                runner.runnerPaused = false;
                 runner.restartCount = 0;
                 runner.attempts = 0;
                 runner.status = "已恢复，继续托管";
@@ -794,6 +860,7 @@ public class SessionManager implements AutoCloseable {
             } catch (Exception ignored) {
             }
             runner.manualAutoOff = true;
+            runner.runnerPaused = true;
             runner.status = "已暂停（点恢复继续）";
         }
         String text = "托管已暂停：" + reason + "（停止 " + stopped + " 个号的脚本，窗口保留）";
@@ -1085,6 +1152,20 @@ public class SessionManager implements AutoCloseable {
             return;
         }
 
+
+        if (runner.runnerPaused) {
+            if (!session.isOpen()) {
+                failPilotRunner(runner, "手动暂停期间窗口已关闭");
+                return;
+            }
+            runner.status = "该号已手动暂停，其他账号继续托管";
+            if (pilotBulkMode) {
+                setBulkStatus(now);
+            } else {
+                setAutoPilotStatus(runner.status);
+            }
+            return;
+        }
         switch (runner.phase) {
             case PILOT_OPENING -> runner.status = "正在打开浏览器";
 
@@ -1157,9 +1238,22 @@ public class SessionManager implements AutoCloseable {
                 }
 
                 if (now - runner.phaseAt > PILOT_CITY_TIMEOUT_MS) {
-                    failPilotRunner(runner, "进城超时，请确认角色状态或网络");
-                } else {
-                    runner.status = "等待进城加载（" + elapsedText(now - runner.phaseAt) + "）";
+                    runner.attempts++;
+                    if (runner.attempts >= PILOT_CITY_MAX_ATTEMPTS) {
+                        failPilotRunner(runner, "进城超时，已重试 "
+                                + PILOT_CITY_MAX_ATTEMPTS + " 次，请确认角色状态或网络");
+                    } else {
+                        log("[托管] 进城加载超过 " + (PILOT_CITY_TIMEOUT_MS / 1000)
+                                + " 秒，第 " + runner.attempts + " 次重新请求进城 "
+                                + pilotRunnerName(runner));
+                        PilotLog.append(pilotRunnerName(runner),
+                                "进城超时，第" + runner.attempts + "次重新请求");
+                        runner.phaseAt = now;
+                        runner.nextActionAt = now;
+                        runner.cityRequested = false;
+                        runner.status = "进城加载较慢，正在重试（"
+                                + runner.attempts + "/" + PILOT_CITY_MAX_ATTEMPTS + "）";
+                    }
                 }
             }
 
@@ -1579,6 +1673,7 @@ public class SessionManager implements AutoCloseable {
         long nextSnapshotAt;
         int noMissionStreak;
         boolean manualAutoOff;
+        boolean runnerPaused;
         long runningSince;
         long lastProgressAt;
         long lastMissionEventAt;
