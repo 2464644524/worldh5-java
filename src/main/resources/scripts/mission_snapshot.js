@@ -1,5 +1,5 @@
 /*
- * 只读任务快照：供桌面控制台每 3 分钟判断当前是否存在 CAN_ACCEPT / CAN_SUBMIT。
+ * 只读任务快照：供桌面控制台每 1 分钟判断当前是否存在 TestAutoGame 会处理的 CAN_ACCEPT / CAN_SUBMIT。
  * 不点击、不接任务、不发网络请求，只读取游戏当前内存里的任务与 NPC 数据。
  */
 (function () {
@@ -127,44 +127,20 @@
 
   function missionBlockedReasons(m, status) {
     var reasons = [];
+    // CAN_SUBMIT 一定算可自动处理：TestAutoGame 对可交付任务直接交，不做城内/支线过滤。
     if (status === "CAN_SUBMIT") return reasons;
     if (status !== "CAN_ACCEPT") return ["notAutoStatus"];
 
-    // AutoGamer 原生逻辑：已经接取在身的任务直接算可自动处理。
-    if (missionAccepted(m)) return reasons;
-
-    try {
-      if (typeof Mission !== "undefined" && isFunction(Mission.isMissionFinish)
-          && Mission.isMissionFinish(xself, m.getId())) {
-        reasons.push("isMissionFinish");
-      }
-    } catch (e) {}
-
-    var methods = [
-      "isOneKeyMission",
-      "isCityBulltinMission",
-      "isCountryAssignTask",
-      "isDirectSubmit",
-      "isUnLimitSubmit",
-      "isNestedMission",
-      "isEscort",
-      "isRandomMission"
-    ];
-    for (var i = 0; i < methods.length; i++) {
-      try {
-        if (isFunction(m[methods[i]]) && m[methods[i]]()) reasons.push(methods[i]);
-      } catch (e) {}
-    }
-
-    // 实测回城后市长/城市 NPC 会长期挂着 3000 段功能、介绍、加工、兑换、领取类 CAN_ACCEPT。
-    // 这些不是 AutoGamer 会继续跑的野外主线；但同段任务若已达到 CAN_SUBMIT，前面会直接放行计为可交。
-    // 只在“当前位于城内”时按 ID 兜底过滤，避免误杀野外地图里的 3022~3026 等任务。
+    // 与 TestAutoGame.isCityTask 保持一致：
+    // 城内只自动点 3060~3075 的城市公告任务；野外地图的 CAN_ACCEPT 都允许。
+    // 不再用 isCountryAssignTask/isNestedMission 等方法粗略排除 750 段主线，
+    // 实测这些任务正是 TestAutoGame 正在连续提交/接取的主线。
     try {
       var missionNumericId = Number(m.getId());
       if (isInCityContext()
           && Number.isFinite(missionNumericId)
-          && missionNumericId >= 3000 && missionNumericId <= 3999) {
-        reasons.push("cityFunctionalAccept");
+          && !(missionNumericId >= 3060 && missionNumericId <= 3075)) {
+        reasons.push("cityAcceptBlockedByTestAutoGame");
       }
     } catch (e) {}
 

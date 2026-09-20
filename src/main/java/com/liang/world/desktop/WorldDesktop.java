@@ -58,6 +58,7 @@ public class WorldDesktop extends JFrame {
     private final JButton[] accountButtons = new JButton[ConfigStore.ACCOUNT_COUNT];
     private JButton syncButton;
     private JButton pilotButton;
+    private JButton pilotStopButton;
     private JButton autoButton;
     private JButton refreshButton;
     private JButton loopButton;
@@ -126,10 +127,14 @@ public class WorldDesktop extends JFrame {
     private JPanel buildActionPanel() {
         JPanel panel = new JPanel(new GridLayout(0, 2, 2, 2));
         panel.setBorder(BorderFactory.createTitledBorder("当前账号"));
-        pilotButton = actionButton("托管", "单号一键托管：等待进游戏、注入、进城并开启自动；再点一次停止（保留窗口）", this::toggleAutoPilot);
+        pilotButton = actionButton("托管", "单号一键托管；托管中可暂停/恢复，彻底结束点旁边按钮", this::toggleAutoPilot);
         pilotButton.setOpaque(true);
         pilotButton.setBorderPainted(true);
         panel.add(pilotButton);
+        pilotStopButton = actionButton("结束", "结束托管但保留窗口；临时接手请点暂停/恢复", this::stopAutoPilotAction);
+        pilotStopButton.setOpaque(true);
+        pilotStopButton.setBorderPainted(true);
+        panel.add(pilotStopButton);
         panel.add(actionButton("打开", "打开当前选中账号", () -> manager.openAccount(selectedIndex)));
         panel.add(actionButton("登录", "进入当前账号的渠道登录页", () -> manager.login(selectedIndex)));
         panel.add(actionButton("刷新", "刷新当前游戏窗口", () -> manager.reload(selectedIndex)));
@@ -143,7 +148,7 @@ public class WorldDesktop extends JFrame {
         panel.add(refreshButton);
         loopButton = toggleButton("跟随", "跟随队长/自动确认押镖（再点一次关闭）", () -> manager.toggleLoop(selectedIndex));
         panel.add(loopButton);
-        panel.add(actionButton("停止", "停止当前账号脚本", () -> manager.stopScripts(selectedIndex)));
+        panel.add(actionButton("停止", "停止当前账号脚本；托管中会自动暂停，之后可点恢复", () -> manager.stopScripts(selectedIndex)));
         panel.add(actionButton("进城", "执行进城", () -> manager.enterCity(selectedIndex)));
         panel.add(actionButton("微端", "领取微端奖励", () -> manager.drawMicroReward(selectedIndex)));
         panel.add(actionButton("清包", "立即清理一次背包垃圾（规则同自动清背包，日志回报出售件数）", () -> manager.clearBagNow(selectedIndex)));
@@ -170,7 +175,7 @@ public class WorldDesktop extends JFrame {
                 () -> manager.startRefreshAll(selectedIndex)));
         panel.add(actionButton("全跟随", "对所有已进入游戏的账号开启跟随",
                 () -> manager.startLoopAll(selectedIndex)));
-        panel.add(actionButton("全停止", "停止所有已进入游戏账号的脚本",
+        panel.add(actionButton("全停止", "停止所有脚本；托管中会自动暂停，之后可点恢复",
                 () -> manager.stopAllScripts(selectedIndex)));
         panel.add(actionButton("全进城", "对所有已进入游戏的账号执行进城",
                 () -> manager.enterCityAll(selectedIndex)));
@@ -308,35 +313,72 @@ public class WorldDesktop extends JFrame {
             return;
         }
         boolean active = manager.isAutoPilotActive();
+        boolean paused = manager.isAutoPilotPaused();
         if (active) {
-            if (manager.isPilotBulkMode()) {
-                pilotButton.setText("停管 " + manager.getFinishedPilotCount()
+            if (paused) {
+                pilotButton.setText("恢复");
+                pilotButton.setBackground(new Color(90, 170, 255));
+            } else if (manager.isPilotBulkMode()) {
+                pilotButton.setText("暂停 " + manager.getFinishedPilotCount()
                         + "/" + manager.getAutoPilotQueueSize());
+                pilotButton.setBackground(new Color(255, 153, 0));
             } else {
-                pilotButton.setText("停管·" + String.format("%02d", manager.getAutoPilotIndex() + 1));
+                pilotButton.setText("暂停·" + String.format("%02d", manager.getAutoPilotIndex() + 1));
+                pilotButton.setBackground(new Color(255, 153, 0));
             }
-            pilotButton.setBackground(new Color(255, 153, 0));
-            pilotButton.setToolTipText("托管中。" + manager.getAutoPilotStatus()
-                    + "；自动/刷怪/跟随仍可手动控制，点击停管会停止整个托管并保留窗口。");
+            pilotButton.setToolTipText((paused ? "托管已暂停，不会自动点击。" : "托管中。")
+                    + manager.getAutoPilotStatus()
+                    + "；点击" + (paused ? "恢复原批次" : "暂停并停止脚本")
+                    + "，彻底结束请点旁边的结束按钮。");
         } else {
             pilotButton.setText("托管");
             pilotButton.setBackground(COLOR_CLOSED);
-            pilotButton.setToolTipText("单号一键托管：等待进游戏、注入、进城并开启自动；再点一次停止（保留窗口）");
+            pilotButton.setToolTipText("单号一键托管：等待进游戏、注入、进城并开启自动；托管中可暂停/恢复");
+        }
+        if (pilotStopButton != null) {
+            pilotStopButton.setEnabled(active);
+            pilotStopButton.setBackground(active ? new Color(255, 205, 205) : COLOR_CLOSED);
+            pilotStopButton.setToolTipText(active
+                    ? "结束当前托管并保留窗口；暂停/恢复请点左边按钮"
+                    : "当前没有运行中的托管");
         }
     }
 
     private void toggleAutoPilot() {
         if (manager.isAutoPilotActive()) {
-            manager.stopAutoPilot();
+            if (manager.isAutoPilotPaused()) {
+                manager.resumeAutoPilot();
+                appendLog("恢复托管：继续原批次/原账号");
+            } else {
+                manager.pauseAutoPilot();
+                appendLog("暂停托管：已停止托管脚本，可手动操作，之后点恢复继续");
+            }
         } else {
             manager.startAutoPilot(selectedIndex);
         }
         refreshAccountButtons();
     }
 
+    private void stopAutoPilotAction() {
+        if (!manager.isAutoPilotActive()) {
+            appendLog("当前没有运行中的托管");
+            return;
+        }
+        int choice = JOptionPane.showConfirmDialog(this,
+                "确定结束当前托管吗？窗口会保留；如果只是临时操作，请点暂停/恢复。",
+                "结束托管", JOptionPane.OK_CANCEL_OPTION);
+        if (choice == JOptionPane.OK_OPTION) {
+            manager.stopAutoPilot();
+            appendLog("已结束托管，窗口保留");
+        }
+        refreshAccountButtons();
+    }
+
     private void startBulkAutoPilot() {
         if (manager.isAutoPilotActive()) {
-            appendLog("托管队列已在运行，当前：" + manager.getAutoPilotStatus());
+            appendLog(manager.isAutoPilotPaused()
+                    ? "托管已暂停，请点恢复继续；如需重新全托请先点结束。"
+                    : "托管队列已在运行，当前：" + manager.getAutoPilotStatus());
             return;
         }
         int choice = JOptionPane.showConfirmDialog(

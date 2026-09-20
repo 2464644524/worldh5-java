@@ -73,6 +73,7 @@ public class SessionManager implements AutoCloseable {
     private volatile int autoPilotIndex = -1;
     private volatile String autoPilotStatus = "";
     private volatile boolean autoPilotActive;
+    private volatile boolean autoPilotPaused;
     private volatile boolean autoPilotStopRequested;
     private int autoPilotPhase = PILOT_IDLE;
     private long autoPilotStartedAt;
@@ -611,6 +612,10 @@ public class SessionManager implements AutoCloseable {
                 log("请先打开账号 " + String.format("%02d", index + 1));
                 return;
             }
+            // 托管中手动点“停止”，视为要接手操作：先暂停整个托管，避免下一秒又自动开脚本/进城/切号。
+            if (autoPilotActive && !autoPilotPaused) {
+                pauseAutoPilot("手动停止 " + store.account(index).displayName() + "，已暂停托管");
+            }
             session.stopScripts();
         });
     }
@@ -721,6 +726,79 @@ public class SessionManager implements AutoCloseable {
 
     public boolean isAutoPilotActive() {
         return autoPilotActive;
+    }
+
+    public boolean isAutoPilotPaused() {
+        return autoPilotPaused;
+    }
+
+    public void pauseAutoPilot() {
+        submit("暂停托管失败", () -> pauseAutoPilot("手动暂停托管"));
+    }
+
+    public void resumeAutoPilot() {
+        submit("恢复托管失败", () -> {
+            if (!autoPilotActive || !autoPilotPaused) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            autoPilotPaused = false;
+            pilotBatchFinishedAt = 0L;
+            for (PilotState runner : pilotRunners) {
+                if (isTerminalPilotPhase(runner.phase)) {
+                    continue;
+                }
+                runner.manualAutoOff = false;
+                runner.restartCount = 0;
+                runner.attempts = 0;
+                runner.status = "已恢复，继续托管";
+                if (runner.phase == PILOT_WAIT_GAME) {
+                    // 暂停处理其它事情的时间不计入登录超时。
+                    runner.startedAt = now;
+                    runner.phaseAt = now;
+                    runner.nextActionAt = now;
+                } else if (runner.phase == PILOT_ENTER_CITY
+                        || runner.phase == PILOT_START_AUTO) {
+                    runner.phaseAt = now;
+                    runner.nextActionAt = now;
+                    runner.cityRequested = false;
+                } else if (runner.phase == PILOT_RUNNING) {
+                    // 暂停时已停脚本，恢复时回到“开启自动”阶段，由状态机重新打开。
+                    runner.phase = PILOT_START_AUTO;
+                    runner.phaseAt = now;
+                    runner.nextActionAt = now;
+                    runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+                }
+            }
+            String text = pilotBulkMode ? "全托已恢复" : "单号托管已恢复";
+            setAutoPilotStatus(text);
+            log("[托管] " + text + "，继续原批次/原账号");
+            PilotLog.append("", text + "，继续原批次");
+        });
+    }
+
+    private void pauseAutoPilot(String reason) {
+        if (!autoPilotActive || autoPilotPaused) {
+            return;
+        }
+        autoPilotPaused = true;
+        int stopped = 0;
+        for (PilotState runner : pilotRunners) {
+            if (isTerminalPilotPhase(runner.phase)) {
+                continue;
+            }
+            try {
+                sessions[runner.slot].stopScriptsIfInGame(false);
+                stopped++;
+            } catch (Exception ignored) {
+            }
+            runner.manualAutoOff = true;
+            runner.status = "已暂停（点恢复继续）";
+        }
+        String text = "托管已暂停：" + reason + "（停止 " + stopped + " 个号的脚本，窗口保留）";
+        setAutoPilotStatus("已暂停（点恢复继续）");
+        log("[托管] " + text);
+        PilotLog.append("", text);
     }
 
     public int getAutoPilotIndex() {
@@ -861,6 +939,10 @@ public class SessionManager implements AutoCloseable {
         if (!autoPilotActive || autoPilotStopRequested) {
             return;
         }
+        if (autoPilotPaused) {
+            setAutoPilotStatus("已暂停（点恢复继续）");
+            return;
+        }
 
         long now = System.currentTimeMillis();
         for (PilotState runner : new ArrayList<>(pilotRunners)) {
@@ -918,6 +1000,7 @@ public class SessionManager implements AutoCloseable {
         pilotBulkMode = true;
         pilotBatchNumber++;
         autoPilotActive = true;
+        autoPilotPaused = false;
         autoPilotStopRequested = false;
         autoPilotIndex = 0;
 
@@ -1194,6 +1277,10 @@ public class SessionManager implements AutoCloseable {
             String ignoredNames = missionNames(ignored);
             String scanned = snapshot.has("scanned") && !snapshot.get("scanned").isJsonNull()
                     ? snapshot.get("scanned").getAsString() : "0";
+            String mapId = snapshot.has("mapId") && !snapshot.get("mapId").isJsonNull()
+                    ? snapshot.get("mapId").getAsString() : "";
+            boolean snapshotInCity = snapshot.has("inCity") && !snapshot.get("inCity").isJsonNull()
+                    && snapshot.get("inCity").getAsBoolean();
 
             StringBuilder detail = new StringBuilder();
             detail.append("主线可接=").append(autoAcceptCount)
@@ -1206,7 +1293,9 @@ public class SessionManager implements AutoCloseable {
             if (!ignoredNames.isEmpty()) detail.append("｜忽略：").append(ignoredNames);
             detail.append("｜原始可接=").append(rawAcceptCount)
                     .append(" 原始可交=").append(rawSubmitCount)
-                    .append(" 扫描对象=").append(scanned);
+                    .append(" 扫描对象=").append(scanned)
+                    .append("｜地图=").append(mapId)
+                    .append(" 城内=").append(snapshotInCity ? "是" : "否");
 
             String text = "[任务快照] " + detail;
             log(text + " " + name);
@@ -1306,6 +1395,7 @@ public class SessionManager implements AutoCloseable {
             log("[托管] " + text);
             PilotLog.append("", "第" + pilotBatchNumber + "批结束：" + text);
             autoPilotActive = false;
+            autoPilotPaused = false;
             autoPilotStopRequested = false;
             autoPilotPhase = PILOT_IDLE;
             setAutoPilotStatus(text);
@@ -1370,6 +1460,7 @@ public class SessionManager implements AutoCloseable {
 
     private void failGlobalAutoPilot(String reason) {
         autoPilotActive = false;
+        autoPilotPaused = false;
         autoPilotStopRequested = false;
         autoPilotPhase = PILOT_FAILED;
         setAutoPilotStatus("失败：" + reason);
@@ -1379,6 +1470,7 @@ public class SessionManager implements AutoCloseable {
 
     private void resetPilotRuntime() {
         autoPilotIndex = -1;
+        autoPilotPaused = false;
         autoPilotStopRequested = false;
         autoPilotPhase = PILOT_IDLE;
         autoPilotStartedAt = 0L;
@@ -1401,6 +1493,7 @@ public class SessionManager implements AutoCloseable {
         int active = getActivePilotCount();
         int finished = getFinishedPilotCount();
         String suffix = pilotBatchFinishedAt != 0L ? "，准备下一批" : "";
+        if (autoPilotPaused) suffix = "，已暂停";
         setAutoPilotStatus("全托第" + pilotBatchNumber + "批·运行"
                 + active + "/" + pilotRunners.size()
                 + "，结束" + finished + "/" + pilotRunners.size() + suffix);
