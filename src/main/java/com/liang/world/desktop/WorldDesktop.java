@@ -31,7 +31,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.util.Properties;
 import javax.swing.JSlider;
 import javax.swing.event.ChangeListener;
@@ -49,6 +55,8 @@ public class WorldDesktop extends JFrame {
     private static final Font SMALL_FONT = new Font("Microsoft YaHei", Font.PLAIN, 11);
     private static final Font ACCOUNT_FONT = new Font("Microsoft YaHei", Font.BOLD, 12);
     private static final Path EXCEL_ACCOUNT_FILE = Path.of("data", "\u8d26\u53f7.xlsx");
+    private static FileChannel singleInstanceChannel;
+    private static FileLock singleInstanceLock;
 
     private static final Color COLOR_CLOSED = new Color(230, 230, 230);
     private static final Color COLOR_OPEN = new Color(120, 170, 255);
@@ -1010,7 +1018,38 @@ public class WorldDesktop extends JFrame {
         });
     }
 
+    private static boolean acquireSingleInstanceLock() {
+        try {
+            Files.createDirectories(Path.of("data"));
+            Path lockFile = Path.of("data", "desktop.lock");
+            singleInstanceChannel = FileChannel.open(lockFile,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE);
+            singleInstanceLock = singleInstanceChannel.tryLock();
+            if (singleInstanceLock == null) {
+                return false;
+            }
+            singleInstanceChannel.truncate(0);
+            String pid = ProcessHandle.current().pid() + System.lineSeparator();
+            singleInstanceChannel.write(ByteBuffer.wrap(pid.getBytes(StandardCharsets.UTF_8)));
+            singleInstanceChannel.force(true);
+            return true;
+        } catch (OverlappingFileLockException e) {
+            return false;
+        } catch (IOException e) {
+            return false;
+        }
+    }
     public static void main(String[] args) {
+        if (!acquireSingleInstanceLock()) {
+            JOptionPane.showMessageDialog(null,
+                    "辅助已经在运行，请勿重复启动。\n如需重启，请先关闭当前辅助窗口。",
+                    "已在运行",
+                    JOptionPane.WARNING_MESSAGE);
+            System.exit(0);
+            return;
+        }
         Rectangle usable = GraphicsEnvironment.getLocalGraphicsEnvironment()
                 .getMaximumWindowBounds();
         Path dataDir = Path.of("data");

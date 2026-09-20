@@ -67,6 +67,7 @@ public class SessionManager implements AutoCloseable {
     private static final long MISSION_SNAPSHOT_INTERVAL_MS = 60_000L;
     private static final long MISSION_SNAPSHOT_RETRY_MS = 60_000L;
     private static final int NO_MISSION_SWITCH_LIMIT = 10;
+    private static final long MISSION_STUCK_TIMEOUT_MS = 10 * 60_000L;
     private static final int PILOT_BATCH_SIZE = 5;
     private static final int PILOT_COMPLETED = 8;
 
@@ -1055,6 +1056,7 @@ public class SessionManager implements AutoCloseable {
         setBulkStatus(now);
     }
 
+
     private PilotState newPilotRunner(int slot, long now, int phase) {
         PilotState runner = new PilotState();
         runner.slot = slot;
@@ -1064,6 +1066,13 @@ public class SessionManager implements AutoCloseable {
         runner.phaseAt = now;
         runner.nextActionAt = now;
         runner.nextSnapshotAt = 0L;
+        runner.noMissionStreak = 0;
+        runner.runningSince = now;
+        runner.lastProgressAt = now;
+        runner.lastMissionEventAt = 0L;
+        runner.lastMissionSignature = "";
+        runner.lastActivitySignature = "";
+        runner.stuckLoggedAt = 0L;
         runner.status = "";
         return runner;
     }
@@ -1244,6 +1253,7 @@ public class SessionManager implements AutoCloseable {
         }
     }
 
+
     private boolean pollPilotMission(PilotState runner, AccountSession session, long now) {
         if (runner.nextSnapshotAt == 0L || now < runner.nextSnapshotAt) {
             return false;
@@ -1263,66 +1273,114 @@ public class SessionManager implements AutoCloseable {
 
             int rawAcceptCount = optionalInt(snapshot, "canAcceptCount");
             int rawSubmitCount = optionalInt(snapshot, "canSubmitCount");
+            int activeAcceptedCount = optionalInt(snapshot, "activeAcceptedCount");
             int autoAcceptCount = optionalInt(snapshot, "autoCanAcceptCount");
             int autoSubmitCount = optionalInt(snapshot, "autoCanSubmitCount");
-            int ignoredCount = optionalInt(snapshot, "ignoredNonAutoCount");
+            int globalAcceptCount = optionalInt(snapshot, "globalCanAcceptCount");
+            int globalSubmitCount = optionalInt(snapshot, "globalCanSubmitCount");
             JsonArray autoAccept = snapshot.has("autoCanAccept") && snapshot.get("autoCanAccept").isJsonArray()
                     ? snapshot.getAsJsonArray("autoCanAccept") : new JsonArray();
             JsonArray autoSubmit = snapshot.has("autoCanSubmit") && snapshot.get("autoCanSubmit").isJsonArray()
                     ? snapshot.getAsJsonArray("autoCanSubmit") : new JsonArray();
-            JsonArray ignored = snapshot.has("ignoredNonAuto") && snapshot.get("ignoredNonAuto").isJsonArray()
-                    ? snapshot.getAsJsonArray("ignoredNonAuto") : new JsonArray();
+            JsonArray activeAccepted = snapshot.has("activeAccepted") && snapshot.get("activeAccepted").isJsonArray()
+                    ? snapshot.getAsJsonArray("activeAccepted") : new JsonArray();
             String acceptNames = missionNames(autoAccept);
             String submitNames = missionNames(autoSubmit);
-            String ignoredNames = missionNames(ignored);
-            String scanned = snapshot.has("scanned") && !snapshot.get("scanned").isJsonNull()
-                    ? snapshot.get("scanned").getAsString() : "0";
-            String mapId = snapshot.has("mapId") && !snapshot.get("mapId").isJsonNull()
-                    ? snapshot.get("mapId").getAsString() : "";
-            boolean snapshotInCity = snapshot.has("inCity") && !snapshot.get("inCity").isJsonNull()
-                    && snapshot.get("inCity").getAsBoolean();
+            String activeNames = missionNames(activeAccepted);
+            String scanned = optionalString(snapshot, "scanned");
+            String mapId = optionalString(snapshot, "mapId");
+            boolean snapshotInCity = optionalBoolean(snapshot, "inCity");
+            boolean inBattle = optionalBoolean(snapshot, "inBattle");
+            String missionSignature = optionalString(snapshot, "signature");
+            String activitySignature = optionalString(snapshot, "activitySignature");
 
             StringBuilder detail = new StringBuilder();
-            detail.append("主线可接=").append(autoAcceptCount)
-                    .append(" 主线可交=").append(autoSubmitCount);
-            if (ignoredCount > 0) {
-                detail.append("｜忽略城市/支线=").append(ignoredCount);
-            }
-            if (!acceptNames.isEmpty()) detail.append("｜主线可接：").append(acceptNames);
-            if (!submitNames.isEmpty()) detail.append("｜主线可交：").append(submitNames);
-            if (!ignoredNames.isEmpty()) detail.append("｜忽略：").append(ignoredNames);
-            detail.append("｜原始可接=").append(rawAcceptCount)
+            detail.append("可接=").append(autoAcceptCount)
+                    .append(" 可交=").append(autoSubmitCount)
+                    .append(" 进行中=").append(activeAcceptedCount);
+            if (!acceptNames.isEmpty()) detail.append("｜可接：").append(acceptNames);
+            if (!submitNames.isEmpty()) detail.append("｜可交：").append(submitNames);
+            if (!activeNames.isEmpty()) detail.append("｜进行中：").append(activeNames);
+            detail.append("｜缓存可接=").append(globalAcceptCount)
+                    .append(" 缓存可交=").append(globalSubmitCount)
+                    .append(" 原始可接=").append(rawAcceptCount)
                     .append(" 原始可交=").append(rawSubmitCount)
-                    .append(" 扫描对象=").append(scanned)
+                    .append(" 扫描对象=").append(scanned.isEmpty() ? "0" : scanned)
                     .append("｜地图=").append(mapId)
-                    .append(" 城内=").append(snapshotInCity ? "是" : "否");
+                    .append(" 城内=").append(snapshotInCity ? "是" : "否")
+                    .append(" 战斗=").append(inBattle ? "是" : "否");
 
-            String text = "[任务快照] " + detail;
-            log(text + " " + name);
+            log("[任务快照] " + detail + " " + name);
             MissionSnapshotLog.append(name, detail.toString());
 
-            if (autoAcceptCount > 0 || autoSubmitCount > 0) {
-                if (runner.noMissionStreak > 0) {
-                    log("[托管] 检测到主线任务，无任务计数已清零 " + name);
+            long missionEventAt = session.getLastMissionEventAt();
+            boolean newMissionEvent = missionEventAt >= runner.runningSince
+                    && missionEventAt != runner.lastMissionEventAt;
+            if (newMissionEvent) {
+                runner.lastMissionEventAt = missionEventAt;
+            }
+
+            boolean signatureChanged = !missionSignature.equals(runner.lastMissionSignature);
+            boolean activityChanged = !activitySignature.isBlank()
+                    && !activitySignature.equals(runner.lastActivitySignature);
+            boolean hasReachableWork = autoAcceptCount > 0 || autoSubmitCount > 0 || activeAcceptedCount > 0;
+            boolean progressed = newMissionEvent || signatureChanged || activityChanged;
+
+            if (progressed) {
+                if (runner.noMissionStreak > 0 || runner.stuckLoggedAt != 0L) {
+                    log("[托管] 检测到任务/画面推进，超时计数已清零 " + name);
                 }
+                runner.noMissionStreak = 0;
+                runner.lastProgressAt = now;
+                runner.stuckLoggedAt = 0L;
+                runner.lastMissionSignature = missionSignature;
+                if (!activitySignature.isBlank()) runner.lastActivitySignature = activitySignature;
+                runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+                return false;
+            }
+
+            if (runner.lastMissionSignature.isEmpty() || runner.lastActivitySignature.isEmpty()) {
+                runner.lastMissionSignature = missionSignature;
+                runner.lastActivitySignature = activitySignature;
+                runner.lastProgressAt = now;
                 runner.noMissionStreak = 0;
                 runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
                 return false;
             }
 
-            runner.noMissionStreak++;
-            log("[托管] 无主线任务计数 " + runner.noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
-                    + "（每1分钟检测，连续10次无主线可接/可交后完成该号） " + name);
-            MissionSnapshotLog.append(name, "无主线任务计数 " + runner.noMissionStreak
-                    + "/" + NO_MISSION_SWITCH_LIMIT);
-            PilotLog.append(name, "无主线任务计数 " + runner.noMissionStreak
-                    + "/" + NO_MISSION_SWITCH_LIMIT);
-            runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+            if (!hasReachableWork) {
+                runner.noMissionStreak++;
+                log("[托管] 无任务计数 " + runner.noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT
+                        + "（每1分钟检测，连续10次无当前可接/可交/进行中任务后完成该号） " + name);
+                MissionSnapshotLog.append(name, "无任务计数 " + runner.noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT);
+                PilotLog.append(name, "无任务计数 " + runner.noMissionStreak + "/" + NO_MISSION_SWITCH_LIMIT);
+                runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
 
-            if (runner.noMissionStreak >= NO_MISSION_SWITCH_LIMIT) {
-                completePilotRunner(runner);
+                if (runner.noMissionStreak >= NO_MISSION_SWITCH_LIMIT) {
+                    completePilotRunner(runner, "连续10分钟没有当前可接/可交/进行中任务");
+                    return true;
+                }
+                return false;
+            }
+
+            long stuckMs = now - runner.lastProgressAt;
+            if (stuckMs >= MISSION_STUCK_TIMEOUT_MS) {
+                String reason = "连续10分钟任务签名和地图/战斗/坐标均无变化，也没有接取/提交/推进事件";
+                log("[托管] " + reason + "，判定卡死或任务已跑完 " + name);
+                MissionSnapshotLog.append(name, reason + "，签名=" + missionSignature + "，画面=" + activitySignature);
+                PilotLog.append(name, reason);
+                completePilotRunner(runner, reason);
                 return true;
             }
+
+            long remainingMs = MISSION_STUCK_TIMEOUT_MS - stuckMs;
+            if (remainingMs <= 60_000L && (runner.stuckLoggedAt == 0L
+                    || now - runner.stuckLoggedAt >= 60_000L)) {
+                runner.stuckLoggedAt = now;
+                log("[托管] 任务列表无真实推进，" + (remainingMs / 1000) + " 秒后将按卡死保底完成 " + name);
+            }
+            runner.noMissionStreak = 0;
+            runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
             return false;
         } catch (Exception e) {
             runner.nextSnapshotAt = now + MISSION_SNAPSHOT_RETRY_MS;
@@ -1334,11 +1392,13 @@ public class SessionManager implements AutoCloseable {
     }
 
     private void completePilotRunner(PilotState runner) {
+        completePilotRunner(runner, "连续10分钟没有可推进任务");
+    }
+
+    private void completePilotRunner(PilotState runner, String reason) {
         String name = pilotRunnerName(runner);
-        log("[托管] 连续 " + NO_MISSION_SWITCH_LIMIT
-                + " 次无主线可接/可交任务，判定该号已跑完 " + name);
-        PilotLog.append(name, "连续" + NO_MISSION_SWITCH_LIMIT
-                + "次无主线可接/可交任务，判定完成");
+        log("[托管] " + reason + "，判定该号已跑完 " + name);
+        PilotLog.append(name, reason + "，判定完成");
         markPilotAccountFinished(runner.slot);
         try {
             sessions[runner.slot].stopScriptsIfInGame(false);
@@ -1352,7 +1412,6 @@ public class SessionManager implements AutoCloseable {
             setAutoPilotStatus("单号托管完成（窗口保留）");
         }
     }
-
     private void advancePilotBatchIfReady(long now) {
         if (!pilotBulkMode || pilotRunners.isEmpty()) {
             return;
@@ -1506,6 +1565,7 @@ public class SessionManager implements AutoCloseable {
         return store.account(runner.slot).displayName();
     }
 
+
     private static final class PilotState {
         int slot;
         int excelRow;
@@ -1519,6 +1579,12 @@ public class SessionManager implements AutoCloseable {
         long nextSnapshotAt;
         int noMissionStreak;
         boolean manualAutoOff;
+        long runningSince;
+        long lastProgressAt;
+        long lastMissionEventAt;
+        long stuckLoggedAt;
+        String lastMissionSignature = "";
+        String lastActivitySignature = "";
         String status = "";
     }
     private List<Integer> buildPilotQueue(int selected) {
@@ -1882,6 +1948,22 @@ public class SessionManager implements AutoCloseable {
         }
     }
 
+
+    private static String optionalString(JsonObject obj, String key) {
+        try {
+            return obj.has(key) && !obj.get(key).isJsonNull() ? obj.get(key).getAsString() : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static boolean optionalBoolean(JsonObject obj, String key) {
+        try {
+            return obj.has(key) && !obj.get(key).isJsonNull() && obj.get(key).getAsBoolean();
+        } catch (Exception e) {
+            return false;
+        }
+    }
     private static int optionalInt(JsonObject obj, String key) {
         try {
             return obj.has(key) && !obj.get(key).isJsonNull() ? obj.get(key).getAsInt() : 0;

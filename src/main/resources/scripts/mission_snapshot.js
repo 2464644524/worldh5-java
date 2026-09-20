@@ -1,20 +1,19 @@
 /*
- * 只读任务快照：供桌面控制台每 1 分钟判断当前是否存在 TestAutoGame 会处理的 CAN_ACCEPT / CAN_SUBMIT。
- * 不点击、不接任务、不发网络请求，只读取游戏当前内存里的任务与 NPC 数据。
+ * 只读任务快照：判断账号当前是否真的有任务可推进。
+ * xworld.npcList 是全局缓存，可能包含其他地图/不可达 NPC，不能全部当作可执行任务。
+ * 可执行任务来源：
+ *   1. xself.missionList：已经接在身上的任务（含打怪/寻路等进行中状态）
+ *   2. 当前打开的 NPC 对话框
+ *   3. 全局 NPC 中明确属于当前地图、可见或任务目标地图就是当前地图的任务
+ * 另输出玩家坐标/战斗状态签名，Java 侧用它识别“一直发寻路但人不动、任务不推进”的卡死。
  */
 (function () {
   if (window.WorldMissionSnapshot && window.WorldMissionSnapshot.__installed) return;
 
   var MAX_ITEMS = 30;
-  var MAX_SCAN = 2000;
+  var MAX_SCAN = 1000;
 
-  function type(v) {
-    return Object.prototype.toString.call(v).slice(8, -1);
-  }
-
-  function isFunction(v) {
-    return typeof v === "function";
-  }
+  function isFunction(v) { return typeof v === "function"; }
 
   function safeCall(obj, method) {
     try {
@@ -25,9 +24,7 @@
 
   function constName(obj, val) {
     try {
-      for (var k in obj) {
-        if (obj[k] === val) return k;
-      }
+      for (var k in obj) if (obj[k] === val) return k;
     } catch (e) {}
     return "";
   }
@@ -48,9 +45,7 @@
     }
     var fields = ["name", "title", "missionName", "taskName", "_name"];
     for (var j = 0; j < fields.length; j++) {
-      try {
-        if (isChineseText(m[fields[j]])) return String(m[fields[j]]).trim();
-      } catch (e) {}
+      try { if (isChineseText(m[fields[j]])) return String(m[fields[j]]).trim(); } catch (e) {}
     }
     return "";
   }
@@ -72,152 +67,131 @@
     return isChineseText(v) ? String(v).trim() : "";
   }
 
-  function actorId(a) {
-    var v = safeCall(a, "getId");
-    if (v === null || v === undefined) {
-      try { v = a.id; } catch (e) { v = ""; }
-    }
-    return v === null || v === undefined ? "" : v;
-  }
-
   function isMission(v) {
     return !!v && typeof v === "object" && isFunction(v.getMissionStatus);
   }
 
   function addUnique(arr, value, limit) {
-    if (!value) return;
+    if (value === null || value === undefined || value === "") return;
     value = String(value);
     if (arr.indexOf(value) < 0 && arr.length < limit) arr.push(value);
   }
 
-  function missionKind(m) {
-    var flags = [];
-    var methods = [
-      "isRandomMission", "isOneKeyMission", "isCityBulltinMission",
-      "isCountryAssignTask", "isEscort", "isDirectSubmit",
-      "isUnLimitSubmit", "isNestedMission"
-    ];
-    for (var i = 0; i < methods.length; i++) {
-      try {
-        if (isFunction(m[methods[i]]) && m[methods[i]]()) flags.push(methods[i]);
-      } catch (e) {}
-    }
-    return flags;
-  }
-
-  function missionAccepted(m) {
+  function currentMapId() {
     try {
-      return !!(xself && isFunction(xself.getMissionById) && xself.getMissionById(m.getId()));
+      var id = safeCall(xworld, "getCurMapID");
+      if (id === null || id === undefined) id = xworld.mapId;
+      var n = Number(id);
+      return Number.isFinite(n) ? n : 0;
     } catch (e) {
-      return false;
+      return 0;
     }
   }
 
   function isInCityContext() {
     try {
-      if (typeof xworld !== "undefined" && xworld) {
-        if (isFunction(xworld.isInCityNow) && xworld.isInCityNow()) return true;
-        // 兜底：当前版本回城后的城市地图 ID 为 14748。
-        var mapId = isFunction(xworld.getCurMapID) ? xworld.getCurMapID() : xworld.mapId;
-        if (Number(mapId) === 14748) return true;
-      }
-    } catch (e) {}
-    return false;
+      if (isFunction(xworld.isInCityNow) && xworld.isInCityNow()) return true;
+      return Number(currentMapId()) === 14748;
+    } catch (e) {
+      return false;
+    }
   }
 
-  function missionBlockedReasons(m, status) {
-    var reasons = [];
-    // CAN_SUBMIT 一定算可自动处理：TestAutoGame 对可交付任务直接交，不做城内/支线过滤。
-    if (status === "CAN_SUBMIT") return reasons;
-    if (status !== "CAN_ACCEPT") return ["notAutoStatus"];
-
-    // 与 TestAutoGame.isCityTask 保持一致：
-    // 城内只自动点 3060~3075 的城市公告任务；野外地图的 CAN_ACCEPT 都允许。
-    // 不再用 isCountryAssignTask/isNestedMission 等方法粗略排除 750 段主线，
-    // 实测这些任务正是 TestAutoGame 正在连续提交/接取的主线。
+  function blockedByCityRule(m) {
     try {
-      var missionNumericId = Number(m.getId());
-      if (isInCityContext()
-          && Number.isFinite(missionNumericId)
-          && !(missionNumericId >= 3060 && missionNumericId <= 3075)) {
-        reasons.push("cityAcceptBlockedByTestAutoGame");
-      }
-    } catch (e) {}
-
-    return reasons;
+      var id = Number(m.getId());
+      return isInCityContext()
+        && Number.isFinite(id)
+        && !(id >= 3060 && id <= 3075);
+    } catch (e) {
+      return false;
+    }
   }
 
   function SnapshotState() {
-    this.map = new Map();
     this.canAccept = [];
     this.canSubmit = [];
+    this.activeAccepted = [];
     this.autoCanAccept = [];
     this.autoCanSubmit = [];
-    this.ignoredNonAuto = [];
+    this.globalCanAccept = [];
+    this.globalCanSubmit = [];
     this.sources = [];
+    this.keys = {};
     this.scanned = 0;
-    this.ignored = 0;
   }
 
   function sourceSeen(state, source) {
     addUnique(state.sources, source, 30);
   }
 
-  function addMission(state, m, source, npc) {
-    if (!m || state.scanned >= MAX_SCAN) return;
-    if (!isMission(m)) return;
-    state.scanned++;
-    sourceSeen(state, source);
+  function makeItem(m, status, source, npc) {
+    return {
+      id: missionId(m),
+      name: missionName(m),
+      status: status,
+      sources: [source],
+      npcNames: npc ? [actorName(npc)].filter(Boolean) : []
+    };
+  }
 
+  function pushUnique(list, item, kind) {
+    var key = kind + "|" + item.id + "|" + item.status;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id === item.id && list[i].status === item.status) {
+        addUnique(list[i].sources, item.sources[0], 8);
+        return;
+      }
+    }
+    if (list.length < MAX_ITEMS) list.push(item);
+  }
+
+  function missionStatus(m, npc) {
     var statusValue;
     try {
-      // 自动任务日志里对 NPC 对话任务使用 getMissionStatus(xself, npc)，
-      // 普通已接任务只传 xself；两种都尝试，任一精确命中 CAN_ACCEPT/CAN_SUBMIT 即记录。
       statusValue = m.getMissionStatus(xself);
       if (npc) {
         var npcStatusValue = m.getMissionStatus(xself, npc);
         var npcStatus = constName(typeof MissionConst !== "undefined" ? MissionConst : null, npcStatusValue);
-        if (npcStatus === "CAN_ACCEPT" || npcStatus === "CAN_SUBMIT") {
-          statusValue = npcStatusValue;
-        }
+        if (npcStatus === "CAN_ACCEPT" || npcStatus === "CAN_SUBMIT") statusValue = npcStatusValue;
       }
     } catch (e) {
+      return "";
+    }
+    return constName(typeof MissionConst !== "undefined" ? MissionConst : null, statusValue);
+  }
+
+  function addMission(state, m, source, npc, trusted, reachable) {
+    if (!m || state.scanned >= MAX_SCAN || !isMission(m)) return;
+    state.scanned++;
+    sourceSeen(state, source);
+
+    var status = missionStatus(m, npc);
+    if (!status) return;
+    var item = makeItem(m, status, source, npc);
+    var isAcceptedSource = source.indexOf("xself.missionList") === 0;
+
+    if (status === "CAN_SUBMIT") {
+      pushUnique(state.canSubmit, item, "rawSubmit");
+      pushUnique(state.globalCanSubmit, item, "globalSubmit");
+      if (isAcceptedSource) pushUnique(state.activeAccepted, item, "active");
+      if (trusted && (isAcceptedSource || reachable || source.indexOf("PanelManager") === 0) && !blockedByCityRule(m)) {
+        pushUnique(state.autoCanSubmit, item, "autoSubmit");
+      }
       return;
     }
-    var status = constName(typeof MissionConst !== "undefined" ? MissionConst : null, statusValue);
-    if (status !== "CAN_ACCEPT" && status !== "CAN_SUBMIT") return;
 
-    var id = missionId(m);
-    var key = String(id) + "|" + status;
-    var item = state.map.get(key);
-    if (!item) {
-      var reasons = missionBlockedReasons(m, status);
-      item = {
-        id: id,
-        name: missionName(m),
-        status: status,
-        sources: [],
-        npcIds: [],
-        npcNames: [],
-        kind: missionKind(m),
-        nonAutoReasons: reasons
-      };
-      state.map.set(key, item);
-      if (status === "CAN_ACCEPT") {
-        state.canAccept.push(item);
-        if (reasons.length === 0) state.autoCanAccept.push(item);
-        else state.ignoredNonAuto.push(item);
-      } else {
-        state.canSubmit.push(item);
-        state.autoCanSubmit.push(item);
+    if (status === "CAN_ACCEPT") {
+      pushUnique(state.canAccept, item, "rawAccept");
+      pushUnique(state.globalCanAccept, item, "globalAccept");
+      if (trusted && (reachable || source.indexOf("PanelManager") === 0) && !blockedByCityRule(m)) {
+        pushUnique(state.autoCanAccept, item, "autoAccept");
       }
+      return;
     }
-    addUnique(item.sources, source, 8);
-    if (npc) {
-      var nid = actorId(npc);
-      if (nid !== "") addUnique(item.npcIds, String(nid), 5);
-      addUnique(item.npcNames, actorName(npc), 5);
-    }
+
+    // NOT_CAN_ACCEPT / NOT_CAN_SUBMIT：身上任务代表已接取，可能正在打怪/采集/寻路。
+    if (isAcceptedSource) pushUnique(state.activeAccepted, item, "active");
   }
 
   function scanAccepted(state) {
@@ -226,46 +200,23 @@
       if (!list || !list.length) return;
       sourceSeen(state, "xself.missionList");
       for (var i = 0; i < list.length && state.scanned < MAX_SCAN; i++) {
-        addMission(state, list[i], "xself.missionList[" + i + "]", null);
+        addMission(state, list[i], "xself.missionList[" + i + "]", null, true, true);
       }
     } catch (e) {}
   }
 
-  function scanNpcMissionArray(state, npc, field, npcIndex) {
-    try {
-      var list = npc[field];
-      if (!list) return;
-      if (isMission(list)) {
-        addMission(state, list, "xworld.npcList[" + npcIndex + "]." + field, npc);
-        return;
-      }
-      // 不同版本里 NPC 可能直接挂 missionData=[...]，也可能包一层 missionData.missionList。
-      if ((typeof list.length !== "number" || !list.length) && list.missionList) {
-        scanNpcMissionArray(state, list, "missionList", npcIndex);
-        return;
-      }
-      if (typeof list.length !== "number" || !list.length) return;
-      var source = "xworld.npcList[" + npcIndex + "]." + field;
-      sourceSeen(state, "xworld.npcList.*." + field);
-      for (var i = 0; i < list.length && state.scanned < MAX_SCAN; i++) {
-        addMission(state, list[i], source + "[" + i + "]", npc);
-      }
-    } catch (e) {}
-  }
-
-  function scanNpcs(state) {
-    try {
-      var npcs = typeof xworld !== "undefined" && xworld ? xworld.npcList : null;
-      if (!npcs || typeof npcs.length !== "number") return;
-      sourceSeen(state, "xworld.npcList");
-      for (var i = 0; i < npcs.length && state.scanned < MAX_SCAN; i++) {
-        var npc = npcs[i];
-        if (!npc) continue;
-        scanNpcMissionArray(state, npc, "missionList", i);
-        scanNpcMissionArray(state, npc, "missionData", i);
-        scanNpcMissionArray(state, npc, "missions", i);
-      }
-    } catch (e) {}
+  function eachMission(list, npc, cb) {
+    if (!list) return;
+    if (isMission(list)) {
+      cb(list, npc);
+      return;
+    }
+    if ((typeof list.length !== "number" || !list.length) && list.missionList) {
+      eachMission(list.missionList, npc, cb);
+      return;
+    }
+    if (typeof list.length !== "number" || !list.length) return;
+    for (var i = 0; i < list.length; i++) cb(list[i], npc);
   }
 
   function scanOpenDialogue(state) {
@@ -276,9 +227,75 @@
       sourceSeen(state, "PanelManager.npcDialogue");
       for (var i = 0; i < dlg._actionList.length && state.scanned < MAX_SCAN; i++) {
         var action = dlg._actionList[i];
-        var data = action && action.data;
-        var mission = data && data.mission;
-        if (mission) addMission(state, mission, "PanelManager.npcDialogue._actionList[" + i + "]", npc);
+        var mission = action && action.data && action.data.mission;
+        if (mission) addMission(state, mission, "PanelManager.npcDialogue[" + i + "]", npc, true, true);
+      }
+    } catch (e) {}
+  }
+
+  function numberFromMethods(obj, methods) {
+    for (var i = 0; i < methods.length; i++) {
+      var v = safeCall(obj, methods[i]);
+      var n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  }
+
+  function numberFromFields(obj, fields) {
+    for (var i = 0; i < fields.length; i++) {
+      try {
+        var n = Number(obj[fields[i]]);
+        if (Number.isFinite(n)) return n;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function npcBelongsToMap(npc, mapId) {
+    if (!npc || !mapId) return false;
+    var id = numberFromMethods(npc, ["getMapID", "getMapId", "getCurMapID", "getMapIdKey"]);
+    if (id === null) id = numberFromFields(npc, ["mapId", "mapID", "mapIDKey", "_mapId", "curMapId", "mapid"]);
+    return id === mapId;
+  }
+
+  function npcVisible(npc) {
+    try {
+      if (isFunction(npc.isVisible) && npc.isVisible()) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function missionMentionsMap(mission, mapId) {
+    if (!mission || !mapId) return false;
+    var id = numberFromMethods(mission, [
+      "getAcceptJumpMapID", "getSubmitJumpMapID", "getTargetMapID",
+      "getMapID", "getMapId", "getFinishMapID"
+    ]);
+    if (id === mapId) return true;
+    id = numberFromFields(mission, [
+      "acceptJumpMapID", "submitJumpMapID", "targetMapID", "finishMapID",
+      "mapId", "mapID", "mapid", "_mapId"
+    ]);
+    return id === mapId;
+  }
+
+  function scanNpcs(state) {
+    try {
+      var npcs = typeof xworld !== "undefined" && xworld ? xworld.npcList : null;
+      if (!npcs || typeof npcs.length !== "number") return;
+      var mapId = currentMapId();
+      sourceSeen(state, "xworld.npcList");
+      for (var i = 0; i < npcs.length && state.scanned < MAX_SCAN; i++) {
+        var npc = npcs[i];
+        if (!npc) continue;
+        var npcReachable = npcBelongsToMap(npc, mapId) || npcVisible(npc);
+        ["missionList", "missionData", "missions"].forEach(function (field) {
+          eachMission(npc[field], npc, function (mission, owner) {
+            var reachable = npcReachable || missionMentionsMap(mission, mapId);
+            addMission(state, mission, "xworld.npcList[" + i + "]." + field, owner, reachable, reachable);
+          });
+        });
       }
     } catch (e) {}
   }
@@ -293,79 +310,105 @@
     if (list.length > MAX_ITEMS) list.length = MAX_ITEMS;
   }
 
+  function ids(list) {
+    return list.map(function (x) { return x.id; }).join(",");
+  }
+
+  function playerPosition() {
+    var x = null, y = null;
+    try {
+      x = numberFromMethods(xself, ["getXKey", "getX", "getXPos"]);
+      y = numberFromMethods(xself, ["getYKey", "getY", "getYPos"]);
+      if ((x === null || y === null) && isFunction(xself.getPosition)) {
+        var p = xself.getPosition();
+        if (p) { x = Number(p.x); y = Number(p.y); }
+      }
+      if (x === null) x = Number(xself.x);
+      if (y === null) y = Number(xself.y);
+    } catch (e) {}
+    return { x: Number.isFinite(x) ? x : null, y: Number.isFinite(y) ? y : null };
+  }
+
   function snapshot() {
-    var state = new SnapshotState();
+    var empty = function (error) {
+      return {
+        ok: !error, canAcceptCount: 0, canSubmitCount: 0,
+        activeAcceptedCount: 0, autoCanAcceptCount: 0, autoCanSubmitCount: 0,
+        canAccept: [], canSubmit: [], activeAccepted: [],
+        autoCanAccept: [], autoCanSubmit: [],
+        globalCanAcceptCount: 0, globalCanSubmitCount: 0, globalCanAccept: [], globalCanSubmit: [],
+        scanned: 0, sources: [], mapId: 0, inCity: false, inBattle: false,
+        playerX: null, playerY: null, signature: "", activitySignature: "", error: error || ""
+      };
+    };
+
     try {
       if (typeof xself === "undefined" || !xself || typeof MissionConst === "undefined") {
-        return {
-          ok: false,
-          canAcceptCount: 0,
-          canSubmitCount: 0,
-          canAccept: [],
-          canSubmit: [],
-          autoCanAccept: [],
-          autoCanSubmit: [],
-          ignoredNonAuto: [],
-          scanned: 0,
-          sources: [],
-          error: "游戏核心对象未就绪"
-        };
+        return empty("游戏核心对象未就绪");
       }
-      scanAccepted(state);
-      scanNpcs(state);
-      scanOpenDialogue(state);
-      var totalCanAccept = state.canAccept.length;
-      var totalCanSubmit = state.canSubmit.length;
-      var autoCanAccept = state.autoCanAccept.length;
-      var autoCanSubmit = state.autoCanSubmit.length;
-      sortItems(state.canAccept);
-      sortItems(state.canSubmit);
-      sortItems(state.autoCanAccept);
-      sortItems(state.autoCanSubmit);
-      sortItems(state.ignoredNonAuto);
 
-      var mapId = 0;
+      var state = new SnapshotState();
+      scanAccepted(state);
+      scanOpenDialogue(state);
+      scanNpcs(state);
+
+      ["canAccept", "canSubmit", "activeAccepted", "autoCanAccept", "autoCanSubmit",
+       "globalCanAccept", "globalCanSubmit"].forEach(function (name) { sortItems(state[name]); });
+
+      var mapId = currentMapId();
       var inCity = false;
-      try { mapId = xworld.getCurMapID ? xworld.getCurMapID() : (xworld.mapId || 0); } catch (e) {}
-      try { inCity = !!(xworld.isInCityNow && xworld.isInCityNow()); } catch (e) {}
+      var inBattle = false;
+      try { inCity = !!(isFunction(xworld.isInCityNow) && xworld.isInCityNow()); } catch (e) {}
+      try { inBattle = !!xworld.inBattle; } catch (e) {}
+      var pos = playerPosition();
+      var dialogueVisible = false;
+      try {
+        dialogueVisible = !!(PanelManager && PanelManager.npcDialogue
+          && PanelManager.npcDialogue.stage && PanelManager.npcDialogue.visible);
+      } catch (e) {}
+
+      var signature = "accept:" + ids(state.autoCanAccept)
+        + ";submit:" + ids(state.autoCanSubmit)
+        + ";active:" + ids(state.activeAccepted);
+
+      // 坐标按 20 单位取整，避免待机轻微抖动导致误判；地图/战斗/对话框变化都视为仍在推进。
+      var activitySignature = "map:" + mapId
+        + ";battle:" + inBattle
+        + ";dlg:" + dialogueVisible
+        + ";xy:" + (pos.x === null ? "?" : Math.round(pos.x / 20))
+        + "," + (pos.y === null ? "?" : Math.round(pos.y / 20));
 
       return {
         ok: true,
-        canAcceptCount: totalCanAccept,
-        canSubmitCount: totalCanSubmit,
+        canAcceptCount: state.canAccept.length,
+        canSubmitCount: state.canSubmit.length,
+        activeAcceptedCount: state.activeAccepted.length,
+        activeAccepted: state.activeAccepted,
         canAccept: state.canAccept,
         canSubmit: state.canSubmit,
-        autoCanAcceptCount: autoCanAccept,
-        autoCanSubmitCount: autoCanSubmit,
+        autoCanAcceptCount: state.autoCanAccept.length,
+        autoCanSubmitCount: state.autoCanSubmit.length,
         autoCanAccept: state.autoCanAccept,
         autoCanSubmit: state.autoCanSubmit,
-        ignoredNonAutoCount: state.ignoredNonAuto.length,
-        ignoredNonAuto: state.ignoredNonAuto,
+        globalCanAcceptCount: state.globalCanAccept.length,
+        globalCanSubmitCount: state.globalCanSubmit.length,
+        globalCanAccept: state.globalCanAccept,
+        globalCanSubmit: state.globalCanSubmit,
         scanned: state.scanned,
         sources: state.sources,
         inCity: inCity,
         mapId: mapId,
+        inBattle: inBattle,
+        playerX: pos.x,
+        playerY: pos.y,
+        signature: signature,
+        activitySignature: activitySignature,
         error: ""
       };
     } catch (e) {
-      return {
-        ok: false,
-        canAcceptCount: 0,
-        canSubmitCount: 0,
-        canAccept: [],
-        canSubmit: [],
-        autoCanAccept: [],
-        autoCanSubmit: [],
-        ignoredNonAuto: [],
-        scanned: state.scanned,
-        sources: state.sources,
-        error: e && e.message ? String(e.message) : String(e)
-      };
+      return empty(e && e.message ? String(e.message) : String(e));
     }
   }
 
-  window.WorldMissionSnapshot = {
-    __installed: true,
-    snapshot: snapshot
-  };
+  window.WorldMissionSnapshot = { __installed: true, snapshot: snapshot };
 })();

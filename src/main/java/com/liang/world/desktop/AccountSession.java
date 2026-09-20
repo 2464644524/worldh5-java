@@ -90,6 +90,8 @@ public class AccountSession implements AutoCloseable {
     public static final int FLAG_REFRESH = 2;
     public static final int FLAG_LOOP = 4;
     private volatile int scriptFlags;
+    // 最近一次真实任务接取/提交/推进事件时间，用于识别“快照误报但游戏没有推进”的卡死状态。
+    private volatile long lastMissionEventAt;
 
     public AccountSession(AccountConfig config, Path profileDir, Rectangle gameBounds,
                           Consumer<String> logger) {
@@ -332,6 +334,9 @@ public class AccountSession implements AutoCloseable {
                 if (args != null && args.length > 0 && args[0] != null) {
                     String text = String.valueOf(args[0]);
                     if (!text.isBlank()) {
+                        if (text.startsWith("接取任务") || text.startsWith("提交任务") || text.startsWith("任务推进")) {
+                            lastMissionEventAt = System.currentTimeMillis();
+                        }
                         log("[任务] " + config.displayName() + " " + text);
                         MissionLog.append(config.displayName(), text);
                         ActionLog.append(config.displayName(), "任务交互 " + text);
@@ -574,6 +579,10 @@ public class AccountSession implements AutoCloseable {
 
     public int scriptFlags() {
         return scriptFlags;
+    }
+
+    public long getLastMissionEventAt() {
+        return lastMissionEventAt;
     }
 
     public synchronized void stopAuto() {
