@@ -427,9 +427,9 @@ public class SessionManager implements AutoCloseable {
             throw new IllegalStateException("Playwright 初始化失败", e.getCause());
         }
 
-        browserExecutor.scheduleWithFixedDelay(this::pollAllSafely, 1, 1, TimeUnit.SECONDS);
+        browserExecutor.scheduleWithFixedDelay(this::safePollAllSafely, 1, 1, TimeUnit.SECONDS);
         // 同步手势冲刷：固定节奏把“边界事件 + 最新一帧移动”广播出去，多余 move 直接合并丢弃。
-        browserExecutor.scheduleWithFixedDelay(this::flushSyncEvents, 1, 20, TimeUnit.MILLISECONDS);
+        browserExecutor.scheduleWithFixedDelay(this::safeFlushSyncEvents, 1, 20, TimeUnit.MILLISECONDS);
         log("控制台已启动");
 
         // 专用启动脚本 run-auto.cmd 会设置该环境变量，用于异常重启后自动恢复全托。
@@ -1018,10 +1018,11 @@ public class SessionManager implements AutoCloseable {
                 continue;
             }
             try {
-                pollPilotRunner(runner, now);
-            } catch (Exception e) {
-                failPilotRunner(runner, "托管异常: " + e.getMessage());
-            }
+                  pollPilotRunner(runner, now);
+              } catch (Throwable e) {
+                  ErrorLog.append("托管账号 " + pilotRunnerName(runner), e);
+                  failPilotRunner(runner, "托管异常: " + e.getMessage());
+              }
         }
 
         if (pilotBulkMode) {
@@ -1413,34 +1414,34 @@ public class SessionManager implements AutoCloseable {
             if (newMissionEvent) {
                 runner.lastMissionEventAt = missionEventAt;
             }
+              boolean signatureChanged = !missionSignature.equals(runner.lastMissionSignature);
+              boolean hasReachableWork = autoAcceptCount > 0 || autoSubmitCount > 0 || activeAcceptedCount > 0;
+              // 只有真实任务事件或任务 ID/状态变化才能重置保底；寻路、切图、开关 NPC 面板不算。
+              boolean progressed = newMissionEvent || signatureChanged;
+              if (!activitySignature.isBlank()) {
+                  runner.lastActivitySignature = activitySignature;
+              }
 
-            boolean signatureChanged = !missionSignature.equals(runner.lastMissionSignature);
-            boolean activityChanged = !activitySignature.isBlank()
-                    && !activitySignature.equals(runner.lastActivitySignature);
-            boolean hasReachableWork = autoAcceptCount > 0 || autoSubmitCount > 0 || activeAcceptedCount > 0;
-            boolean progressed = newMissionEvent || signatureChanged || activityChanged;
+              if (progressed) {
+                  if (runner.noMissionStreak > 0 || runner.stuckLoggedAt != 0L) {
+                      log("[托管] 检测到任务状态推进，超时计数已清零 " + name);
+                  }
+                  runner.noMissionStreak = 0;
+                  runner.lastProgressAt = now;
+                  runner.stuckLoggedAt = 0L;
+                  runner.lastMissionSignature = missionSignature;
+                  runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+                  return false;
+              }
 
-            if (progressed) {
-                if (runner.noMissionStreak > 0 || runner.stuckLoggedAt != 0L) {
-                    log("[托管] 检测到任务/画面推进，超时计数已清零 " + name);
-                }
-                runner.noMissionStreak = 0;
-                runner.lastProgressAt = now;
-                runner.stuckLoggedAt = 0L;
-                runner.lastMissionSignature = missionSignature;
-                if (!activitySignature.isBlank()) runner.lastActivitySignature = activitySignature;
-                runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
-                return false;
-            }
+              if (runner.lastMissionSignature.isEmpty()) {
+                  runner.lastMissionSignature = missionSignature;
+                  runner.lastProgressAt = now;
+                  runner.noMissionStreak = 0;
+                  runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
+                  return false;
+              }
 
-            if (runner.lastMissionSignature.isEmpty() || runner.lastActivitySignature.isEmpty()) {
-                runner.lastMissionSignature = missionSignature;
-                runner.lastActivitySignature = activitySignature;
-                runner.lastProgressAt = now;
-                runner.noMissionStreak = 0;
-                runner.nextSnapshotAt = now + MISSION_SNAPSHOT_INTERVAL_MS;
-                return false;
-            }
 
             if (!hasReachableWork) {
                 runner.noMissionStreak++;
@@ -1459,9 +1460,9 @@ public class SessionManager implements AutoCloseable {
 
             long stuckMs = now - runner.lastProgressAt;
             if (stuckMs >= MISSION_STUCK_TIMEOUT_MS) {
-                String reason = "连续10分钟任务签名和地图/战斗/坐标均无变化，也没有接取/提交/推进事件";
-                log("[托管] " + reason + "，判定卡死或任务已跑完 " + name);
-                MissionSnapshotLog.append(name, reason + "，签名=" + missionSignature + "，画面=" + activitySignature);
+                String reason = "连续10分钟任务列表无变化，也没有接取/提交/推进事件";
+                  log("[托管] " + reason + "，判定卡死或任务已跑完 " + name);
+                  MissionSnapshotLog.append(name, reason + "，任务签名=" + missionSignature);
                 PilotLog.append(name, reason);
                 completePilotRunner(runner, reason);
                 return true;
@@ -2257,6 +2258,26 @@ public class SessionManager implements AutoCloseable {
             sessions[safeIndex].bringToFront();
         }
     }
+    private void safePollAllSafely() {
+        try {
+            pollAllSafely();
+        } catch (Throwable t) {
+            ErrorLog.append("playwright-worker 总轮询", t);
+            try {
+                log("辅助总轮询捕获严重错误，调度线程将继续运行: " + t);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void safeFlushSyncEvents() {
+        try {
+            flushSyncEvents();
+        } catch (Throwable t) {
+            ErrorLog.append("同步手势广播", t);
+        }
+    }
+
 
     private void pollAllSafely() {
         for (int i = 0; i < sessions.length; i++) {
@@ -2269,9 +2290,10 @@ public class SessionManager implements AutoCloseable {
                     flushSyncEvents();
                 }
                 refreshState(i);
-            } catch (Exception e) {
-                log("注入轮询异常: " + e.getMessage());
-            }
+            } catch (Throwable e) {
+                  ErrorLog.append("注入轮询账号 " + (i + 1), e);
+                  log("注入轮询异常: " + e.getMessage());
+              }
         }
         pollAutoPilot();
     }
