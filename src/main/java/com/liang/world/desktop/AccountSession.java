@@ -10,6 +10,7 @@ import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.ElementHandle;
 import com.microsoft.playwright.Frame;
 import com.microsoft.playwright.Page;
+import com.microsoft.playwright.Route;
 import com.microsoft.playwright.options.ViewportSize;
 import com.microsoft.playwright.Playwright;
 import com.microsoft.playwright.options.LoadState;
@@ -84,6 +85,7 @@ public class AccountSession implements AutoCloseable {
 
     // 主控号采集到的归一化触摸事件，交给 SessionManager 广播（可能由 Playwright 网络回调线程触发）。
     private volatile java.util.function.Consumer<String> syncEventListener;
+    private volatile java.util.function.LongFunction<String> syncPollHandler;
 
     // 自动/刷怪/跟随在游戏内的真实运行状态（读 TestXxx._isStarting），每秒轮询刷新。
     public static final int FLAG_AUTO = 1;
@@ -372,6 +374,7 @@ public class AccountSession implements AutoCloseable {
             return null;
         });
         context.onPage(this::onContextPage);
+        installSyncRoute();
         onContextPage(page);
         hydrateOfficialCredentials();
         if (forceFreshLogin) {
@@ -757,6 +760,10 @@ public class AccountSession implements AutoCloseable {
         this.syncEventListener = listener;
     }
 
+    public void setSyncPollHandler(java.util.function.LongFunction<String> handler) {
+        this.syncPollHandler = handler;
+    }
+
     // 接收主控广播来的手势（归一化坐标 JSON），在本号游戏帧对应位置重放触摸事件。
     // 只能在 playwright-worker 线程调用。
     public synchronized void replaySyncEvent(String payload) {
@@ -774,6 +781,49 @@ public class AccountSession implements AutoCloseable {
         } catch (Exception ignored) {
         }
     }
+    private void installSyncRoute() {
+        context.route((java.util.function.Predicate<String>)
+                url -> url != null && url.contains("/__world_sync__"), this::handleSyncRoute);
+    }
+
+    private void handleSyncRoute(Route route) {
+        try {
+            long since = parseSyncSince(route.request().url());
+            java.util.function.LongFunction<String> handler = syncPollHandler;
+            String body = handler != null
+                    ? handler.apply(since)
+                    : "{\"ok\":true,\"seq\":0,\"events\":[]}";
+            route.fulfill(new Route.FulfillOptions()
+                    .setStatus(200)
+                    .setContentType("application/json; charset=utf-8")
+                    .setHeaders(java.util.Map.of("Cache-Control", "no-store"))
+                    .setBody(body));
+        } catch (Exception e) {
+            try {
+                route.abort("failed");
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static long parseSyncSince(String url) {
+        try {
+            java.net.URI uri = new java.net.URI(url);
+            String query = uri.getRawQuery();
+            if (query == null || query.isBlank()) return 0L;
+            for (String pair : query.split("&")) {
+                int eq = pair.indexOf('=');
+                String key = eq >= 0 ? pair.substring(0, eq) : pair;
+                if ("since".equals(key)) {
+                    String value = eq >= 0 ? pair.substring(eq + 1) : "";
+                    return Long.parseLong(java.net.URLDecoder.decode(value, java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return 0L;
+    }
+
 
     // 同步重放是高频调用（拖动时节流到约 24ms 一次），优先复用轮询已跟踪到的游戏主页帧，
     // 避免每次都遍历全部页面/iframe；定位不到时再全量兜底。

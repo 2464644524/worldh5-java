@@ -1,10 +1,11 @@
 (function () {
-  // 被控号：接收主控归一化坐标，在本号游戏画面盒对应位置重放 Touch 事件。
   if (window.__worldSyncReplayInstalled) return;
   window.__worldSyncReplayInstalled = true;
 
   var TOUCH_ID = 2000;
   var gestureTarget = null;
+  var since = 0;
+  var inflight = false;
 
   function gameBox() {
     var el = document.querySelector('.egret-player');
@@ -13,6 +14,14 @@
       if (r && r.width > 2 && r.height > 2) return r;
     }
     return { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  }
+
+  function isGameReady() {
+    try {
+      return !!document.querySelector('.egret-player') || typeof xself !== 'undefined';
+    } catch (e) {
+      return false;
+    }
   }
 
   function dispatch(type, nx, ny) {
@@ -52,17 +61,53 @@
     } catch (e) {}
   }
 
-  // Java 侧 evaluate 调用；入参可能是 JSON 字符串，也可能直接是对象。
   window.__worldSyncRecv = function (payload) {
     try {
       var d = typeof payload === 'string' ? JSON.parse(payload) : payload;
-      if (!d || typeof d.t !== 'string') return;
-      if (typeof d.x !== 'number' || typeof d.y !== 'number') return;
-      dispatch(d.t, d.x, d.y);
+      if (d && typeof d.t === 'string') dispatch(d.t, d.x, d.y);
     } catch (e) {}
   };
 
   window.__worldSyncClear = function () {
     gestureTarget = null;
   };
+
+  function endpoint() {
+    return window.location.origin + '/__world_sync__?since=' + since;
+  }
+
+  function loop() {
+    if (!isGameReady()) {
+      setTimeout(loop, 200);
+      return;
+    }
+    if (inflight) {
+      setTimeout(loop, 24);
+      return;
+    }
+    inflight = true;
+    fetch(endpoint(), { cache: 'no-store', credentials: 'same-origin' })
+      .then(function (response) { return response.json(); })
+      .then(function (data) {
+        if (!data || !data.ok) return;
+        var events = Array.isArray(data.events) ? data.events : [];
+        for (var i = 0; i < events.length; i++) {
+          var item = events[i];
+          var seq = Number(item && item.seq);
+          var d = item && item.d;
+          if (!Number.isFinite(seq) || seq <= since || !d || typeof d.t !== 'string') continue;
+          dispatch(d.t, d.x, d.y);
+          since = seq;
+        }
+        var latest = Number(data.seq);
+        if (Number.isFinite(latest)) since = Math.max(since, latest);
+      })
+      .catch(function () {})
+      .finally(function () {
+        inflight = false;
+        setTimeout(loop, 24);
+      });
+  }
+
+  loop();
 })();

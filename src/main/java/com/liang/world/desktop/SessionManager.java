@@ -49,6 +49,7 @@ public class SessionManager implements AutoCloseable {
             new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final java.util.concurrent.atomic.AtomicReference<String> latestSyncMove =
             new java.util.concurrent.atomic.AtomicReference<>();
+    private final SyncBus syncBus = new SyncBus();
 
     // 单号一键托管：等待进游戏 → 注入 → 进城 → 开自动 → 持续守护 → 无主线任务自动切号。
     private static final int PILOT_IDLE = 0;
@@ -274,7 +275,8 @@ public class SessionManager implements AutoCloseable {
                 }
             }
         });
-        syncMaster = next;
+            syncBus.reset();
+            syncMaster = next;
         log("同步主控已切换为 " + String.format("%02d", next + 1));
     }
 
@@ -293,10 +295,12 @@ public class SessionManager implements AutoCloseable {
             this.syncMaster = Math.max(0, Math.min(masterIndex, sessions.length - 1));
             syncBoundaryQueue.clear();
             latestSyncMove.set(null);
+            syncBus.reset();
             this.syncEnabled = true;
             log("同步操作已开启：主控 " + String.format("%02d", this.syncMaster + 1)
                     + "，操作该号会同步到其它已进入游戏的号");
         } else {
+            syncBus.reset();
             this.syncEnabled = false;
             syncBoundaryQueue.clear();
             latestSyncMove.set(null);
@@ -313,6 +317,23 @@ public class SessionManager implements AutoCloseable {
             });
         }
     }
+    private String pollSyncBus(int slot, long since) {
+        long seq = syncBus.sequence();
+        List<SyncBus.SyncEvent> events = slot == syncMaster
+                ? List.of() : syncBus.eventsAfter(since);
+        StringBuilder json = new StringBuilder()
+                .append("{\"ok\":true,\"seq\":").append(seq)
+                .append(",\"events\":[");
+        for (int i = 0; i < events.size(); i++) {
+            SyncBus.SyncEvent event = events.get(i);
+            if (i > 0) json.append(',');
+            json.append("{\"seq\":").append(event.sequence)
+                    .append(",\"d\":").append(event.payload).append('}');
+        }
+        json.append("]}");
+        return json.toString();
+    }
+
 
     // Playwright 回调线程触发：只接受“已开启 + 主控号”的事件。
     // 不在本线程碰 Playwright：start/end 入边界队列，move 只存最新值，交由 worker 定时冲刷。
@@ -320,14 +341,7 @@ public class SessionManager implements AutoCloseable {
         if (!syncEnabled || sourceIndex != syncMaster || payload == null || payload.isBlank()) {
             return;
         }
-        String type = syncEventType(payload);
-        if ("move".equals(type)) {
-            latestSyncMove.set(payload);
-        } else if ("start".equals(type) || "end".equals(type)) {
-            // 新的按下/抬起到来后，尚未冲刷的旧 move 没有意义，直接丢弃，保证顺序不错乱。
-            latestSyncMove.set(null);
-            syncBoundaryQueue.add(payload);
-        }
+        syncBus.publish(payload);
     }
 
     private static String syncEventType(String payload) {
@@ -408,6 +422,7 @@ public class SessionManager implements AutoCloseable {
             sessions[i].setGameScale(gameScale);
             final int sessionIndex = i;
             sessions[i].setSyncEventListener(payload -> handleSyncEvent(sessionIndex, payload));
+            sessions[i].setSyncPollHandler(since -> pollSyncBus(sessionIndex, since));
         }
 
         try {
@@ -429,7 +444,6 @@ public class SessionManager implements AutoCloseable {
 
         browserExecutor.scheduleWithFixedDelay(this::safePollAllSafely, 1, 1, TimeUnit.SECONDS);
         // 同步手势冲刷：固定节奏把“边界事件 + 最新一帧移动”广播出去，多余 move 直接合并丢弃。
-        browserExecutor.scheduleWithFixedDelay(this::safeFlushSyncEvents, 1, 20, TimeUnit.MILLISECONDS);
         log("控制台已启动");
 
         // 专用启动脚本 run-auto.cmd 会设置该环境变量，用于异常重启后自动恢复全托。
