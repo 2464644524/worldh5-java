@@ -1,6 +1,6 @@
 (function () {
-  // 主控号：捕获本机鼠标手势，归一化到 Egret 游戏画面盒坐标后，
-  // 通过 Playwright 暴露的 __worldSyncSend 回传 Java，再由控制台广播给其它号。
+  // 主控号：捕获本机物理鼠标手势，归一化到 Egret 游戏画面盒坐标后，
+  // 通过 Playwright 暴露的 __worldSyncSend 回传 Java 并发布到同步总线。
   if (window.__worldSyncCaptureInstalled) return;
   window.__worldSyncCaptureInstalled = true;
 
@@ -10,27 +10,26 @@
   var throttleUntil = 0;
 
   function normalize(e) {
-    var x = e.clientX;
-    var y = e.clientY;
     var el = document.querySelector('.egret-player');
     if (el) {
       var r = el.getBoundingClientRect();
       if (r && r.width > 2 && r.height > 2) {
-        return { x: (x - r.left) / r.width, y: (y - r.top) / r.height };
+        return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
       }
     }
-    return { x: x / window.innerWidth, y: y / window.innerHeight };
+    return { x: e.clientX / window.innerWidth, y: e.clientY / window.innerHeight };
   }
 
   function emit(type, nx, ny) {
     try {
-      if (typeof window.__worldSyncSend !== 'function') return;
-      window.__worldSyncSend(JSON.stringify({ t: type, x: nx, y: ny }));
+      if (typeof window.__worldSyncSend === 'function') {
+        window.__worldSyncSend(JSON.stringify({ t: type, x: nx, y: ny }));
+      }
     } catch (e) {}
   }
 
   function onDown(e) {
-    if (e.button !== 0) return;
+    if (!e.isTrusted || e.button !== 0) return;
     var p = normalize(e);
     down = true;
     lastNX = p.x;
@@ -39,10 +38,10 @@
   }
 
   function onMove(e) {
-    if (!down) return;
+    if (!e.isTrusted || !down) return;
     var now = Date.now();
     if (now < throttleUntil) return;
-    throttleUntil = now + 24;
+    throttleUntil = now + 16;
     var p = normalize(e);
     lastNX = p.x;
     lastNY = p.y;
@@ -50,7 +49,7 @@
   }
 
   function onUp(e) {
-    if (!down) return;
+    if (!e.isTrusted || !down) return;
     down = false;
     var p = normalize(e);
     emit('end', p.x, p.y);
@@ -62,7 +61,7 @@
     emit('end', lastNX, lastNY);
   }
 
-  // 用原生捕获阶段监听，游戏内部 stopPropagation 也挡不住采集。
+  // 捕获阶段监听，游戏内部 stopPropagation 也挡不住；只接收物理事件，避免合成事件回环。
   document.addEventListener('mousedown', onDown, { capture: true, passive: true });
   window.addEventListener('mousemove', onMove, { capture: true, passive: true });
   window.addEventListener('mouseup', onUp, { capture: true, passive: true });

@@ -72,25 +72,25 @@
   }
 
   document.addEventListener('mousedown', function (e) {
-    if (e.button !== 0) return;
+    if (!e.isTrusted || e.button !== 0) return;
     touching = true;
     dispatch('touchstart', e);
   }, { capture: true, passive: false });
 
   document.addEventListener('mousemove', function (e) {
-    if (!touching) return;
+    if (!e.isTrusted || !touching) return;
     dispatch('touchmove', e);
   }, { capture: true, passive: false });
 
   function endTouch(e) {
-    if (!touching) return;
+    if (!e.isTrusted || !touching) return;
     touching = false;
     dispatch('touchend', e);
   }
 
   document.addEventListener('mouseup', endTouch, { capture: true, passive: false });
   document.addEventListener('mousecancel', function (e) {
-    if (!touching) return;
+    if (!e.isTrusted || !touching) return;
     touching = false;
     dispatch('touchcancel', e);
   }, { capture: true, passive: false });

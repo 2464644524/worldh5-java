@@ -6,6 +6,7 @@ import java.util.List;
 /**
  * 主控手势总线：主控窗口发布一次，其它窗口通过虚拟同源地址独立轮询。
  * 不再由 Playwright 单线程逐个 evaluate 到每个窗口，避免事件积压。
+ * generation 在开启/关闭/切换主控时递增，用于隔离旧手势序号和按下状态。
  */
 public final class SyncBus {
     public static final class SyncEvent {
@@ -23,6 +24,7 @@ public final class SyncBus {
 
     private final List<SyncEvent> events = new ArrayList<>();
     private long sequence;
+    private long generation = 1;
 
     public synchronized void publish(String payload) {
         if (payload == null || payload.isBlank()) {
@@ -36,8 +38,13 @@ public final class SyncBus {
     }
 
     public synchronized void reset() {
+        generation++;
         sequence = 0;
         events.clear();
+    }
+
+    public synchronized long generation() {
+        return generation;
     }
 
     public synchronized long sequence() {
@@ -49,7 +56,7 @@ public final class SyncBus {
         if (sequence == 0 || after >= sequence) {
             return result;
         }
-        // 总线被重置时从头读取，防止被控号停在旧的 sequence。
+        // 正常情况下客户端会按 generation 清零；这里仍保留越界保护。
         if (after < 0 || after > sequence) {
             after = 0;
         }

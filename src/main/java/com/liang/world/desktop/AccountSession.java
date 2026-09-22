@@ -764,23 +764,6 @@ public class AccountSession implements AutoCloseable {
         this.syncPollHandler = handler;
     }
 
-    // 接收主控广播来的手势（归一化坐标 JSON），在本号游戏帧对应位置重放触摸事件。
-    // 只能在 playwright-worker 线程调用。
-    public synchronized void replaySyncEvent(String payload) {
-        if (!isOpen() || payload == null || payload.isBlank()) {
-            return;
-        }
-        Frame target = preferredReplayFrame();
-        if (target == null) {
-            return;
-        }
-        try {
-            target.evaluate(
-                    "(p) => { try { if (window.__worldSyncRecv) window.__worldSyncRecv(p); } catch (e) {} }",
-                    payload);
-        } catch (Exception ignored) {
-        }
-    }
     private void installSyncRoute() {
         context.route((java.util.function.Predicate<String>)
                 url -> url != null && url.contains("/__world_sync__"), this::handleSyncRoute);
@@ -849,9 +832,21 @@ public class AccountSession implements AutoCloseable {
         return locateGameFrame(false).orElse(null);
     }
 
-    // 同步关闭或异常时，松开本号可能残留的按下状态。
-    public synchronized void clearSyncGesture() {
+    // 同步关闭、主控切换或异常时，松开本号可能残留的按下状态。
+    // activeOnly=true 时只清当前主帧，减少主控切换时对其它窗口的跨进程打扰。
+    public synchronized void clearSyncGesture(boolean activeOnly) {
         if (!isOpen()) {
+            return;
+        }
+        String script = "() => { try { window.__worldSyncClear && window.__worldSyncClear(); } catch (e) {} }";
+        if (activeOnly) {
+            Frame frame = preferredReplayFrame();
+            if (frame != null) {
+                try {
+                    frame.evaluate(script);
+                } catch (Exception ignored) {
+                }
+            }
             return;
         }
         for (Page candidate : activePages()) {
@@ -861,8 +856,7 @@ public class AccountSession implements AutoCloseable {
                 }
                 for (Frame frame : candidate.frames()) {
                     try {
-                        frame.evaluate(
-                                "() => { try { window.__worldSyncClear && window.__worldSyncClear(); } catch (e) {} }");
+                        frame.evaluate(script);
                     } catch (Exception ignored) {
                     }
                 }
@@ -870,7 +864,6 @@ public class AccountSession implements AutoCloseable {
             }
         }
     }
-
     public synchronized String captureCurrentGameUrl() {
         ensureOpen();
         Optional<Frame> gameFrame = locateGameFrame(false);

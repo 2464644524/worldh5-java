@@ -41,14 +41,9 @@ public class SessionManager implements AutoCloseable {
     private ScheduledExecutorService browserExecutor;
     private Playwright playwright;
 
-    // 同步操作：开启后，主控号的游戏手势会广播给其它已进入游戏的号同步执行。
+    // 同步操作：开启后，主控号的游戏手势会发布到内存总线，其它号独立拉取并执行。
     private volatile boolean syncEnabled;
     private volatile int syncMaster = -1;
-    // start/end 是边界事件，必须按序送达；move 是高频事件，只保留最新一帧，避免单线程队列积压。
-    private final java.util.concurrent.ConcurrentLinkedQueue<String> syncBoundaryQueue =
-            new java.util.concurrent.ConcurrentLinkedQueue<>();
-    private final java.util.concurrent.atomic.AtomicReference<String> latestSyncMove =
-            new java.util.concurrent.atomic.AtomicReference<>();
     private final SyncBus syncBus = new SyncBus();
 
     // 单号一键托管：等待进游戏 → 注入 → 进城 → 开自动 → 持续守护 → 无主线任务自动切号。
@@ -257,7 +252,7 @@ public class SessionManager implements AutoCloseable {
     }
 
     // 同步已开启时，切换主控号（一般跟随辅助栏当前选中/前置的号）。
-    public void setSyncMaster(int index) {
+    public synchronized void setSyncMaster(int index) {
         if (!syncEnabled) {
             return;
         }
@@ -265,18 +260,22 @@ public class SessionManager implements AutoCloseable {
         if (next == syncMaster) {
             return;
         }
+        int previous = syncMaster;
+        // 先切世代，再换主控：被控端发现 generation 变化会清掉旧手势和序号。
+        syncBus.reset();
+        syncMaster = next;
         submit("清理同步手势失败", () -> {
-            for (AccountSession session : sessions) {
+            for (int i = 0; i < sessions.length; i++) {
                 try {
+                    AccountSession session = sessions[i];
                     if (session != null) {
-                        session.clearSyncGesture();
+                        // 新旧主控都清一次：旧主控解除残留状态，新主控防止旧状态干扰。
+                        session.clearSyncGesture(i == previous || i == next);
                     }
                 } catch (Exception ignored) {
                 }
             }
         });
-            syncBus.reset();
-            syncMaster = next;
         log("同步主控已切换为 " + String.format("%02d", next + 1));
     }
 
@@ -290,26 +289,24 @@ public class SessionManager implements AutoCloseable {
 
     // 开启/关闭同步。开启时以 masterIndex（当前前置的号）为主控，
     // 主控游戏内的点击/拖动会按归一化坐标在其它已进入游戏的号上原样重放。
-    public void setSyncEnabled(boolean enabled, int masterIndex) {
+    public synchronized void setSyncEnabled(boolean enabled, int masterIndex) {
         if (enabled) {
             this.syncMaster = Math.max(0, Math.min(masterIndex, sessions.length - 1));
-            syncBoundaryQueue.clear();
-            latestSyncMove.set(null);
             syncBus.reset();
             this.syncEnabled = true;
             log("同步操作已开启：主控 " + String.format("%02d", this.syncMaster + 1)
                     + "，操作该号会同步到其它已进入游戏的号");
         } else {
+            int previous = syncMaster;
             syncBus.reset();
             this.syncEnabled = false;
-            syncBoundaryQueue.clear();
-            latestSyncMove.set(null);
             log("同步操作已关闭");
             submit("清理同步手势失败", () -> {
-                for (AccountSession session : sessions) {
+                for (int i = 0; i < sessions.length; i++) {
                     try {
+                        AccountSession session = sessions[i];
                         if (session != null) {
-                            session.clearSyncGesture();
+                            session.clearSyncGesture(i == previous);
                         }
                     } catch (Exception ignored) {
                     }
@@ -317,12 +314,18 @@ public class SessionManager implements AutoCloseable {
             });
         }
     }
-    private String pollSyncBus(int slot, long since) {
+
+    private synchronized String pollSyncBus(int slot, long since) {
+        long generation = syncBus.generation();
         long seq = syncBus.sequence();
-        List<SyncBus.SyncEvent> events = slot == syncMaster
-                ? List.of() : syncBus.eventsAfter(since);
+        boolean on = syncEnabled;
+        List<SyncBus.SyncEvent> events = on && slot != syncMaster
+                ? syncBus.eventsAfter(since)
+                : List.of();
         StringBuilder json = new StringBuilder()
-                .append("{\"ok\":true,\"seq\":").append(seq)
+                .append("{\"ok\":true,\"on\":").append(on)
+                .append(",\"gen\":").append(generation)
+                .append(",\"seq\":").append(seq)
                 .append(",\"events\":[");
         for (int i = 0; i < events.size(); i++) {
             SyncBus.SyncEvent event = events.get(i);
@@ -334,68 +337,13 @@ public class SessionManager implements AutoCloseable {
         return json.toString();
     }
 
-
     // Playwright 回调线程触发：只接受“已开启 + 主控号”的事件。
-    // 不在本线程碰 Playwright：start/end 入边界队列，move 只存最新值，交由 worker 定时冲刷。
-    private void handleSyncEvent(int sourceIndex, String payload) {
+    private synchronized void handleSyncEvent(int sourceIndex, String payload) {
         if (!syncEnabled || sourceIndex != syncMaster || payload == null || payload.isBlank()) {
             return;
         }
         syncBus.publish(payload);
     }
-
-    private static String syncEventType(String payload) {
-        try {
-            com.google.gson.JsonObject obj =
-                    com.google.gson.JsonParser.parseString(payload).getAsJsonObject();
-            return obj.has("t") ? obj.get("t").getAsString() : "";
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    // 固定在 playwright-worker 单线程执行：按序重放边界事件，最多再补一帧最新移动。
-    // 坐标是绝对归一化值，丢帧只会让被控号直接跳到最新位置，不会错位。
-    private void flushSyncEvents() {
-        if (!syncEnabled) {
-            return;
-        }
-        final int master = syncMaster;
-        java.util.List<String> boundaries = new java.util.ArrayList<>();
-        String boundary;
-        while ((boundary = syncBoundaryQueue.poll()) != null) {
-            boundaries.add(boundary);
-            if (boundaries.size() >= 8) {
-                break;
-            }
-        }
-        String move = boundaries.isEmpty() ? latestSyncMove.getAndSet(null) : null;
-        if (boundaries.isEmpty() && move == null) {
-            return;
-        }
-        for (int i = 0; i < sessions.length; i++) {
-            if (i == master) {
-                continue;
-            }
-            AccountSession session = sessions[i];
-            if (session == null || !session.isOpen() || !session.isBootstrapped()) {
-                continue;
-            }
-            for (String payload : boundaries) {
-                try {
-                    session.replaySyncEvent(payload);
-                } catch (Exception ignored) {
-                }
-            }
-            if (move != null) {
-                try {
-                    session.replaySyncEvent(move);
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
     public void closeAccount(int index) {
         submit("关闭账号失败", () -> {
             sessions[index].close();
@@ -2284,24 +2232,12 @@ public class SessionManager implements AutoCloseable {
         }
     }
 
-    private void safeFlushSyncEvents() {
-        try {
-            flushSyncEvents();
-        } catch (Throwable t) {
-            ErrorLog.append("同步手势广播", t);
-        }
-    }
-
-
     private void pollAllSafely() {
         for (int i = 0; i < sessions.length; i++) {
             try {
                 AccountSession session = sessions[i];
                 if (session != null) {
                     session.pollBootstrap();
-                    // 每处理完一个号就立刻把待同步手势广播出去，
-                    // 让同步延迟上限≈单个号的检测耗时（稳态仅 1 次往返），而不是整轮 10 个号。
-                    flushSyncEvents();
                 }
                 refreshState(i);
             } catch (Throwable e) {
